@@ -1,1 +1,1 @@
-{"version": "1.4", "ref": "c3f0fdc0d08b46e27160db71021187a8d45d740d", "notes": "Car Thing remote, and Left / Right labels for the vinyl edges."}
+{"version": "1.4.1", "ref": "9cfe97e79818e52f4c6e207cacf7721798293805", "notes": "Fixes running the installer again from /opt/zombieplot."}
