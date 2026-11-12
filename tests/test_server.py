@@ -79,6 +79,8 @@ try:
 
     c, b = get("/")
     check("page served", c == 200 and b"<title>zombiePlot</title>" in b)
+    c, b = get("/thing")
+    check("Car Thing page served", c == 200 and b"<title>zombiePlot</title>" in b and b'id="keys"' in b)
     c, b = get("/manifest.json"); check("manifest", c == 200 and json.loads(b)["display"] == "standalone")
     c, b = get("/icon.svg"); check("icon", c == 200 and b.startswith(b"<svg"))
     c, j = getj("/nope"); check("404", c == 404 and j["ok"] is False)

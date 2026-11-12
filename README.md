@@ -167,7 +167,7 @@ All positions are measured from the cutter's start point (origin). The page move
 |---|---|---|
 | Access PIN | Without a PIN, anyone on your network can use the page. With one, each phone or computer asks for it once. | none |
 | Usable vinyl width | Same as Width on the vinyl bar. | Plotter width |
-| Start jobs from | The start point side of the vinyl, or the far side. With the far side, jobs sit against the opposite edge. Uses the vinyl width, so keep that accurate. | Start point side |
+| Start jobs from | The left edge of the vinyl (the plotter's start point), or the right edge. With the right edge, jobs sit against the opposite edge from the start point. Uses the vinyl width, so keep that accurate. | Left edge |
 | Gap between copies and jobs | Space left between copies and between jobs. | 5 mm |
 | When the job ends | Return to the start point; move to the next free spot so you can see where the next job goes; or feed the vinyl past the job so you can cut it off. | Return |
 | Overcut on closed shapes | Cuts slightly past the start of each closed shape so the corner weeds cleanly. 0 turns it off. | 1 mm |
@@ -216,6 +216,81 @@ Open **Settings**. The **Updates** section shows the installed version.
 Only published releases are offered, never half-finished changes. If a download is damaged or fails its self-test, it isn't installed and the old version keeps running.
 
 The updater needs the Pi to reach `raw.githubusercontent.com`. To update by hand instead, log in and run the one-line installer from Step 4 again.
+
+---
+
+## Car Thing remote (optional)
+
+A Spotify Car Thing plugged into one of the Pi's USB ports becomes a remote that sits on the cutter: pick a file with its dial, set copies, cut and stop, without getting your phone out. It talks to the Pi over the USB cable only, so it needs no Wi-Fi.
+
+**Pi** → USB cable → **Car Thing**
+
+### Controls
+
+| | Files screen | Job screen |
+|---|---|---|
+| **Dial** | choose a file | number of copies |
+| **Press the dial** | open the file | CUT (press again within 4 seconds) |
+| **Back button** (under the dial) | | back to the files |
+| **Button 1** (top, leftmost) | refresh the list | rotate |
+| **Button 2** | new vinyl (press twice) | mirror |
+| **Button 3** | undo last (press twice) | side by side / stacked |
+| **Button 4** | | next free spot / start point |
+| **Top-right button** | STOP while a job is sending | STOP while a job is sending |
+
+The top of the screen always shows what the four buttons do right now. Everything can also be tapped on the touchscreen.
+
+### What you need
+
+- A Car Thing and a USB-C cable that carries data (not a charge-only cable).
+- A Windows, Mac or Linux computer for flashing the Car Thing once.
+- Enough USB power. The original Model B+ shares about 0.6 A across its USB ports. With the Car Thing, the plotter cable and a Wi-Fi adapter all plugged in, use a 2.5 A power supply and add `max_usb_current=1` to `/boot/firmware/config.txt` (`/boot/config.txt` on older systems), or plug the Car Thing into a powered USB hub.
+
+### Step 1: Flash the Car Thing with adb turned on (once, on your computer)
+
+The Car Thing's own software has adb (the USB debugging connection zombiePlot uses) switched off. A community tool turns it on:
+
+1. Get **superbird-tool** (https://github.com/bishopdynamics/superbird-tool), or the flasher built into **DeskThing** (https://github.com/ItsRiprod/DeskThing), and an adb-enabled Car Thing image that tool recommends. Follow that tool's own instructions for your computer.
+2. Put the Car Thing in USB burn mode: hold **buttons 1 and 4** while plugging it into the computer. The screen stays dark.
+3. **Windows only:** run **Zadig**, choose the device named **GX-CHIP**, and install the **WinUSB** driver.
+4. **Back up the Car Thing first** with the tool's dump option, so you can always put the original software back.
+5. Flash the adb-enabled image and let the Car Thing restart.
+
+### Step 2: Turn on the remote on the Pi
+
+Log in to the Pi (Step 3 above) and run the installer again:
+
+```
+sudo bash /opt/zombieplot/install.sh
+```
+
+Answer **y** to "Set up the Car Thing remote?". It installs adb and a small service, `zombieplot-carthing`, that waits for the Car Thing.
+
+### Step 3: Plug it in
+
+Plug the Car Thing into the Pi. The first time, the Pi puts a small start page on the Car Thing and restarts its screen (the original screen is saved on the Car Thing). After a few seconds the file list appears. From then on it opens zombiePlot every time it's plugged in or the Pi restarts.
+
+If you set an access PIN, the Car Thing asks for it once on a number pad. Only digits can be typed there, so use a PIN made of numbers if you want to use the Car Thing.
+
+### Taking it off again
+
+To stop using the Car Thing with zombiePlot and put its original screen back, plug it into the Pi and run:
+
+```
+sudo systemctl disable --now zombieplot-carthing
+```
+```
+sudo python3 /opt/zombieplot/zombieplot.py --car-thing-restore
+```
+
+Then run the installer again and answer **n** to the Car Thing question, so it removes the service.
+
+### If it doesn't work
+
+- **The Car Thing says "Waiting for zombiePlot..."** The Pi isn't reaching it. Check the cable carries data, then see the service's messages: `sudo journalctl -u zombieplot-carthing -n 30`.
+- **"no devices" in those messages:** adb can't see the Car Thing. Run `sudo adb devices`. If the list is empty, the Car Thing wasn't flashed with adb on (Step 1), or the cable is charge-only.
+- **The Pi restarts or the plotter cable drops out when the Car Thing is plugged in:** not enough USB power. See "What you need".
+- **The dial turns the wrong way:** tell us in an issue. Car Thing software versions differ.
 
 ---
 
@@ -298,13 +373,14 @@ zombiePlot is built for a home or shop network. See [SECURITY.md](SECURITY.md) f
 - **With simulated cables:**
   - Reading SVG files: lines, curves, arcs, shapes, transforms, hidden layers and units.
   - The exact commands sent to the cutter.
-  - Copies, placement on the vinyl, the far-side option, the warning for used vinyl.
+  - Copies, placement on the vinyl, the right-edge option, the warning for used vinyl.
   - Stop, a cable unplugged and plugged back in, and restarts.
   - The page in a phone-sized browser.
 - **Not tested:**
   - Other cutter models.
   - Serial cables on real hardware.
   - Whether the Stop command (`ESC .K`) works over a parallel cable on every model.
+  - The Car Thing remote on a real Car Thing. Its page has been tested in a browser at the Car Thing's 800 × 480 size with its dial and buttons simulated, and the USB side against a simulated adb.
 
 ---
 
@@ -313,7 +389,7 @@ zombiePlot is built for a home or shop network. See [SECURITY.md](SECURITY.md) f
 Run the tests (Python 3.9+, standard library only; `test_ui.py` also needs Playwright with Chromium):
 
 ```
-for t in geometry placement updater security server parallel; do python3 tests/test_$t.py; done
+for t in geometry placement updater security server parallel carthing; do python3 tests/test_$t.py; done
 ```
 
 To publish a release:

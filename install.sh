@@ -46,7 +46,7 @@ drop_share_lines() {
 
 remove_units() {
     local u
-    for u in $APP-autoupdate.timer $APP-update.path $APP.service $APP-update.service $APP-autoupdate.service plotter.service; do
+    for u in $APP-carthing.service $APP-autoupdate.timer $APP-update.path $APP.service $APP-update.service $APP-autoupdate.service plotter.service; do
         systemctl disable --now "$u" >/dev/null 2>&1 || true
         rm -f "/etc/systemd/system/$u"
     done
@@ -69,7 +69,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$HERE/$APP.py" ] || fail "$APP.py must be in the same folder as install.sh."
 
 # ---------------------------------------------------------------- 1. program
-say "1/7  Installing the program"
+say "1/8  Installing the program"
 command -v python3 >/dev/null || { apt-get update && apt-get install -y python3; }
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' \
     || fail "Python 3.9 or newer is required. This system has $(python3 --version 2>&1)."
@@ -113,7 +113,7 @@ fi
 echo "Version $NEWVER is in $PROG, settings in $DATA."
 
 # ---------------------------------------------------------------- 2. cable drivers
-say "2/7  Setting up the plotter cable drivers"
+say "2/8  Setting up the plotter cable drivers"
 echo usblp > /etc/modules-load.d/$APP.conf
 modprobe usblp 2>/dev/null && echo "USB-to-parallel driver (usblp) loaded and set to load on every boot." \
     || echo "WARNING: the usblp driver did not load. A USB-to-parallel cable will not work until it does."
@@ -128,7 +128,7 @@ if systemctl list-unit-files 2>/dev/null | grep -q '^ModemManager\.service'; the
 fi
 
 # ---------------------------------------------------------------- 3. wifi
-say "3/7  Turning off Wi-Fi power saving"
+say "3/8  Turning off Wi-Fi power saving"
 if [ -d /etc/NetworkManager/conf.d ]; then
     printf '[connection]\nwifi.powersave = 2\n' > /etc/NetworkManager/conf.d/$APP-wifi-powersave.conf
     systemctl reload NetworkManager 2>/dev/null || true
@@ -138,7 +138,7 @@ else
 fi
 
 # ---------------------------------------------------------------- 4. file folder
-say "4/7  Where your SVG files live"
+say "4/8  Where your SVG files live"
 LIB="$DATA/files"
 CURRENT=""
 [ -f "$ENVFILE" ] && CURRENT="$(sed -n 's/^ZOMBIEPLOT_LIBRARY=//p' "$ENVFILE" | tail -n 1)"
@@ -204,7 +204,7 @@ else
 fi
 
 # ---------------------------------------------------------------- 5. service
-say "5/7  Setting it to start on every boot"
+say "5/8  Setting it to start on every boot"
 OLDPORT=""
 ALLOWED=""
 [ -f "$ENVFILE" ] && OLDPORT="$(sed -n 's/^ZOMBIEPLOT_HTTP_PORT=//p' "$ENVFILE" | tail -n 1)"
@@ -237,7 +237,7 @@ WantedBy=multi-user.target
 EOF
 
 # ---------------------------------------------------------------- 6. updates
-say "6/7  Setting up updates"
+say "6/8  Setting up updates"
 cat > /etc/systemd/system/$APP-update.service <<EOF
 [Unit]
 Description=zombiePlot update (requested from the Settings page)
@@ -289,8 +289,66 @@ systemctl restart $APP-update.path $APP-autoupdate.timer
 echo "Updates can be installed from the Settings page. Automatic overnight updates are off until you switch them on there."
 systemctl restart $APP.service
 
-# ---------------------------------------------------------------- 7. check
-say "7/7  Checking"
+# ---------------------------------------------------------------- 7. car thing
+say "7/8  Car Thing remote (optional)"
+CT_UNIT=/etc/systemd/system/$APP-carthing.service
+WANT_CT=0
+if [ "$MODE" = "--upgrade" ]; then
+    [ -f "$CT_UNIT" ] && WANT_CT=1
+elif [ -f "$CT_UNIT" ]; then
+    read -r -p "The Car Thing remote is set up. Keep it? [Y/n] " ans
+    case "$ans" in [nN]*) ;; *) WANT_CT=1 ;; esac
+else
+    echo "A Spotify Car Thing plugged into this box's USB port can work as a remote:"
+    echo "pick files with its dial, cut, stop. It must be flashed with adb turned on first (see README)."
+    read -r -p "Set up the Car Thing remote? [y/N] " ans
+    case "$ans" in [yY]*) WANT_CT=1 ;; esac
+fi
+if [ "$WANT_CT" = 1 ]; then
+    if ! command -v adb >/dev/null; then
+        echo "Installing adb..."
+        { apt-get update >/dev/null && apt-get install -y adb >/dev/null; } \
+            || apt-get install -y android-tools-adb >/dev/null \
+            || fail "Could not install adb. Check this box has internet access, then run the installer again."
+    fi
+    cat > "$CT_UNIT" <<EOF
+[Unit]
+Description=zombiePlot Car Thing remote (USB)
+After=$APP.service
+
+[Service]
+EnvironmentFile=-$ENVFILE
+StateDirectory=$APP-carthing
+Environment=HOME=/var/lib/$APP-carthing
+ExecStart=/usr/bin/python3 $PROG/$APP.py --car-thing --data $DATA
+ExecStopPost=-$(command -v adb) kill-server
+Restart=always
+RestartSec=5
+PrivateTmp=yes
+ProtectHome=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable $APP-carthing.service >/dev/null 2>&1
+    systemctl restart $APP-carthing.service
+    echo "Car Thing remote is on. Plug the Car Thing into this box; its screen switches to zombiePlot."
+    echo "Messages: sudo journalctl -u $APP-carthing -n 30"
+else
+    if [ -f "$CT_UNIT" ]; then
+        systemctl disable --now $APP-carthing.service >/dev/null 2>&1 || true
+        rm -f "$CT_UNIT"
+        systemctl daemon-reload
+        echo "Car Thing remote removed."
+    else
+        echo "Skipped."
+    fi
+fi
+
+# ---------------------------------------------------------------- 8. check
+say "8/8  Checking"
 sleep 4
 if ! systemctl is-active --quiet $APP.service; then
     journalctl -u $APP.service -n 20 --no-pager || true

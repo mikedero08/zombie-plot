@@ -37,7 +37,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.3"
+VERSION = "1.4"
 UNITS_PER_MM = 40.0          # CAMM-GL III step = 0.025 mm
 FLATTEN_TOL_MM = 0.03        # curve-to-line tolerance (about one cutter step)
 MAX_UPLOAD = 25 * 1024 * 1024
@@ -1746,6 +1746,8 @@ def selftest():
         raise SystemExit("self-test: bad SVG size")
     if not PAGE.startswith("<!doctype html>"):
         raise SystemExit("self-test: page missing")
+    if not THING.startswith("<!doctype html>") or "/thing" not in car_thing_launcher():
+        raise SystemExit("self-test: Car Thing page missing")
     print(VERSION)
 
 
@@ -1938,13 +1940,15 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST" and self.headers.get("X-ZombiePlot") != "1":
                 # Browsers cannot add this header on requests from other websites.
                 return self._fail("Blocked: this request did not come from the zombiePlot page.", 403)
-            public = path in ("/", "/index.html", "/manifest.json", "/icon.svg", "/api/login")
+            public = path in ("/", "/index.html", "/thing", "/manifest.json", "/icon.svg", "/api/login")
             local_status = path == "/api/status" and self.client_address[0] in ("127.0.0.1", "::1")
             if not (public or local_status or app.auth.ok(self.headers.get("Cookie"))):
                 return self._fail("Enter the PIN to use this page.", 401, auth=True)
             if method == "GET":
                 if path in ("/", "/index.html"):
                     return self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
+                if path == "/thing":
+                    return self._send(200, THING.encode("utf-8"), "text/html; charset=utf-8")
                 if path == "/manifest.json":
                     return self._send(200, MANIFEST.encode("utf-8"), "application/manifest+json")
                 if path == "/icon.svg":
@@ -2194,7 +2198,7 @@ h2{font-size:15px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)
   <h2>Vinyl</h2>
   <label class="f"><span id="l-vw">Usable vinyl width</span><input id="s-vw" inputmode="decimal"></label>
   <p class="note">How far across the plotter can cut on the vinyl loaded now. Change it when you load a different width.</p>
-  <label class="f">Start jobs from<select id="s-corner"><option value="origin">The plotter's start point (origin) side</option><option value="far">The other side of the vinyl</option></select></label>
+  <label class="f">Start jobs from<select id="s-corner"><option value="origin">Left edge (the plotter's start point)</option><option value="far">Right edge</option></select></label>
   <label class="f"><span id="l-gap">Gap between copies and jobs</span><input id="s-gap" inputmode="decimal"></label>
   <label class="f">When the job ends<select id="s-end"><option value="origin">Return to the start point</option><option value="next">Move to the next free spot</option><option value="advance">Feed the vinyl past the job</option></select></label>
   <label class="f">Overcut on closed shapes (mm)<input id="s-over" inputmode="decimal"></label>
@@ -2333,8 +2337,8 @@ async function refreshPreview(){
       t += "<br>All " + p.copies + ": <b>" + len(p.job_w) + " wide &times; " + len(p.job_h) + " long</b> (" + how + ")";
     }
     const along = p.base[1], across = p.far ? p.vinyl_width - p.base[0] - p.job_w : p.base[0];
-    const at = (along < 0.05 && across < 0.05) ? (p.far ? "At the far-side corner" : "At the start point")
-             : "Placed " + len(across) + " across" + (p.far ? " from the far side" : "") + ", " + len(along) + " along";
+    const at = (along < 0.05 && across < 0.05) ? (p.far ? "At the right-hand corner" : "At the start point")
+             : "Placed " + len(across) + " across" + (p.far ? " from the right" : "") + ", " + len(along) + " along";
     t += "<br>" + at + " &middot; " + p.shapes + " shape" + (p.shapes === 1 ? "" : "s");
     $("dims").innerHTML = t;
     const notes = p.warnings.map(w => '<div class="msg' + (p.fits && !(p.clash && w.startsWith("This spot")) ? "" : " bad") + '">' + esc(w) + "</div>");
@@ -2366,8 +2370,8 @@ function draw(p){
     '<path class="edge" d="M0 ' + top + 'V0H' + VW + 'V' + top + '"/>' + used +
     '<rect class="jobbox" x="' + bx + '" y="' + by + '" width="' + p.job_w + '" height="' + p.job_h + '"/>' +
     '<g>' + uses + '</g><circle class="org" r="' + r + '"/></g>' +
-    '<text class="lbl" x="0" y="' + (H + m + fs * 0.9) + '" font-size="' + fs + '">Start point</text>' +
-    '<text class="lbl" x="' + VW + '" y="' + (H + m + fs * 0.9) + '" font-size="' + fs + '" text-anchor="end">Far side</text></svg>';
+    '<text class="lbl" x="0" y="' + (H + m + fs * 0.9) + '" font-size="' + fs + '">Left</text>' +
+    '<text class="lbl" x="' + VW + '" y="' + (H + m + fs * 0.9) + '" font-size="' + fs + '" text-anchor="end">Right</text></svg>';
 }
 
 function disarm(){ S.armed = 0; }
@@ -2620,6 +2624,564 @@ $("up").onchange = async ev => {
 """
 
 
+# ----------------------------------------------------------------------------
+# Car Thing remote (Spotify Car Thing plugged into this box's USB port)
+# ----------------------------------------------------------------------------
+# The Car Thing's screen is a Chromium web view that loads a page from its own flash. With adb
+# turned on (flashed once from a PC), --car-thing puts a small launcher page there and runs
+# "adb reverse", so the Car Thing reaches this box's web server at http://localhost:8742 over USB.
+# The launcher opens /thing, which is served from here like the phone page, so it gets the same
+# protections (Host check, X-ZombiePlot header, PIN). The Car Thing never needs Wi-Fi.
+#
+# Car Thing input as the web view sees it: dial turn = wheel event, dial press = Enter,
+# back button = Escape, the four top buttons = 1 to 4, the top-right button = m.
+
+CAR_THING_PORT = 8742
+CAR_THING_WEBAPP = "/usr/share/qt-superbird-app/webapp"
+CAR_THING_BACKUP = CAR_THING_WEBAPP + ".before-zombieplot"
+
+
+class CarThingError(Exception):
+    pass
+
+
+def car_thing_launcher():
+    """The page put on the Car Thing's flash. Waits until this box answers, then opens /thing."""
+    return ("<!doctype html><html><head><meta charset=\"utf-8\"><title>zombiePlot</title></head>"
+            "<body style=\"margin:0;background:#15181b;color:#97a2ab;font:28px sans-serif;display:flex;"
+            "align-items:center;justify-content:center;height:100vh\"><div>Waiting for zombiePlot...</div>"
+            "<script>var base='http://localhost:%d';function go(){location.replace(base+'/thing');}"
+            "function tryit(){if(!window.fetch){setTimeout(go,3000);return;}"
+            "fetch(base+'/api/status',{mode:'no-cors',cache:'no-store'}).then(go,function(){setTimeout(tryit,2000);});}"
+            "tryit();</script></body></html>" % CAR_THING_PORT)
+
+
+def _adb(adb, *args, timeout=60):
+    try:
+        r = subprocess.run([adb] + list(args), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise CarThingError("adb %s timed out" % args[0])
+    return r.returncode, (r.stdout or "").strip()
+
+
+def _adb_ok(adb, *args, timeout=60):
+    code, out = _adb(adb, *args, timeout=timeout)
+    if code:
+        raise CarThingError("adb %s failed: %s" % (" ".join(args)[:80], _tail(out, 300)))
+    return out
+
+
+def car_thing_reverse(adb, http_port):
+    _adb_ok(adb, "reverse", "tcp:%d" % CAR_THING_PORT, "tcp:%d" % http_port)
+
+
+def car_thing_install_page(adb):
+    """Puts the launcher on the Car Thing if it isn't there yet. True when it changed the screen."""
+    page = car_thing_launcher()
+    mark = hashlib.sha256(page.encode("utf-8")).hexdigest()[:16]
+    _, cur = _adb(adb, "shell", "cat %s/.zombieplot 2>/dev/null" % CAR_THING_WEBAPP)
+    if cur.strip() == mark:
+        return False
+    w, b = CAR_THING_WEBAPP, CAR_THING_BACKUP
+    _adb_ok(adb, "shell", "mount -o remount,rw / && { [ -e %s ] || [ ! -d %s ] || cp -a %s %s; } "
+                          "&& rm -rf %s && mkdir -p %s && echo ok" % (b, w, w, b, w, w))
+    fd, tmp = tempfile.mkstemp(suffix=".html")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(page)
+        _adb_ok(adb, "push", tmp, w + "/index.html")
+    finally:
+        os.remove(tmp)
+    _adb(adb, "shell", "echo %s > %s/.zombieplot; sync; mount -o remount,ro / 2>/dev/null; "
+                       "supervisorctl restart chromium >/dev/null 2>&1 || reboot" % (mark, w))
+    return True
+
+
+def car_thing_restore(adb):
+    """Puts back whatever the Car Thing's screen showed before zombiePlot."""
+    w, b = CAR_THING_WEBAPP, CAR_THING_BACKUP
+    out = _adb_ok(adb, "shell", "[ -d %s ] && mount -o remount,rw / && rm -rf %s && mv %s %s && sync "
+                                "&& echo restored || echo nobackup" % (b, w, b, w))
+    if "restored" not in out:
+        raise CarThingError("There is no earlier screen saved on this Car Thing.")
+    _adb(adb, "shell", "mount -o remount,ro / 2>/dev/null; supervisorctl restart chromium >/dev/null 2>&1 || reboot")
+
+
+def run_car_thing(http_port, restore=False):
+    """Runs as root next to the web page (zombieplot-carthing.service). Handles plug and unplug."""
+    adb = shutil.which("adb")
+    if not adb:
+        raise SystemExit("adb is not installed. Run: sudo apt-get install -y adb")
+
+    def log(msg):
+        sys.stderr.write(msg + "\n")
+        sys.stderr.flush()
+
+    if restore:
+        log("Waiting for the Car Thing to be plugged in...")
+        _adb(adb, "wait-for-usb-device", timeout=None)
+        try:
+            car_thing_restore(adb)
+        except CarThingError as e:
+            raise SystemExit(str(e))
+        log("Done. The Car Thing shows its earlier screen again.")
+        return
+    log("zombiePlot %s: Car Thing remote, forwarding its port %d to web port %d"
+        % (VERSION, CAR_THING_PORT, http_port))
+    while True:
+        code, out = _adb(adb, "wait-for-usb-device", timeout=None)
+        if code:
+            log("adb: " + _tail(out, 200))
+            time.sleep(10)
+            continue
+        try:
+            car_thing_reverse(adb, http_port)
+            if car_thing_install_page(adb):
+                log("Car Thing connected; its screen now opens zombiePlot.")
+            else:
+                log("Car Thing connected.")
+        except CarThingError as e:
+            log("Car Thing: %s" % e)
+            time.sleep(10)
+            continue
+        while True:
+            time.sleep(5)
+            try:
+                code, state = _adb(adb, "get-state", timeout=15)
+                if code or state != "device":
+                    log("Car Thing unplugged.")
+                    break
+                _, rev = _adb(adb, "reverse", "--list", timeout=15)
+                if "tcp:%d" % CAR_THING_PORT not in rev:
+                    car_thing_reverse(adb, http_port)
+            except CarThingError as e:
+                log("Car Thing: %s" % e)
+                break
+
+
+THING = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zombiePlot</title>
+<style>
+/* Sized for the Car Thing's 800 x 480 screen and its old Chromium: no flex gap, no newer syntax. */
+:root{--bg:#15181b;--panel:#1e2327;--line:#30373d;--text:#e9edf0;--dim:#97a2ab;--go:#f2a33a;--go-text:#1a1305;
+--ok:#4fbf7b;--warn:#f2a33a;--bad:#ef5d52;--vinyl:#262c31}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--text);
+font:20px/1.3 system-ui,"Segoe UI",sans-serif;-webkit-user-select:none;user-select:none}
+::-webkit-scrollbar{display:none}
+button{font:inherit;color:inherit;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:0}
+button:disabled{opacity:.4}
+[hidden]{display:none!important}
+#keys{height:42px;display:flex;align-items:stretch;border-bottom:1px solid var(--line)}
+#keys .k{flex:1;display:flex;align-items:center;padding:0 8px;font-size:17px;color:var(--dim);white-space:nowrap;overflow:hidden}
+#keys .k i{font-style:normal;display:inline-block;min-width:22px;height:22px;line-height:20px;text-align:center;border:1px solid var(--line);
+border-radius:11px;font-size:13px;margin-right:6px;color:var(--dim)}
+#keys .k b{font-weight:600;color:var(--text);overflow:hidden;text-overflow:ellipsis}
+#keys .k.on b{color:var(--go)}
+#keys .k.armed{background:var(--go)}#keys .k.armed b,#keys .k.armed i{color:var(--go-text);border-color:var(--go-text)}
+#keys .k.empty{visibility:hidden}
+#keys .k.m{flex:0 0 110px;justify-content:flex-end}
+#keys .k.m b{color:var(--bad)}
+#bar{height:36px;display:flex;align-items:center;padding:0 12px;font-size:17px;color:var(--dim)}
+#pill{display:inline-flex;align-items:center;font-weight:650;color:var(--text);margin-right:14px}
+#pill:before{content:"";width:12px;height:12px;border-radius:6px;margin-right:7px;background:var(--dim)}
+#pill.ok:before{background:var(--ok)}#pill.warn:before{background:var(--warn)}#pill.bad:before{background:var(--bad)}
+#vtxt{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#vtxt b{color:var(--text)}
+#prog{height:4px;background:var(--line)}#bar2{height:4px;width:0;background:var(--ok)}
+main{position:absolute;top:82px;left:0;right:0;bottom:0}
+section{position:absolute;top:0;left:0;right:0;bottom:0}
+#list{list-style:none;margin:0;padding:4px 10px 10px;height:100%;overflow-y:auto}
+#list li{display:flex;align-items:center;height:62px;padding:0 14px;margin-bottom:6px;border-radius:10px;
+background:var(--panel);border:2px solid transparent}
+#list li.sel{border-color:var(--go)}
+#list .n{flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:22px}
+#list .f{color:var(--dim);font-size:16px;margin-left:10px}
+#list .s{color:var(--dim);font-size:16px;margin-left:12px;white-space:nowrap}
+.hint{color:var(--dim);font-size:16px}
+#empty{padding:30px 24px;color:var(--dim)}
+#stage{position:absolute;left:10px;top:4px;bottom:10px;width:50%;background:var(--vinyl);border:1px solid var(--line);border-radius:10px}
+#stage svg{position:absolute;left:0;top:0;width:100%;height:100%;color:var(--text)}
+#stage .edge{fill:none;stroke:var(--dim);stroke-width:1;vector-effect:non-scaling-stroke}
+#stage .org{fill:var(--go)}
+#stage .used{fill:var(--dim);fill-opacity:.22;stroke:var(--dim);stroke-width:1;stroke-dasharray:4 3;vector-effect:non-scaling-stroke}
+#stage .jobbox{fill:none;stroke:var(--go);stroke-width:1.5;stroke-dasharray:6 4;vector-effect:non-scaling-stroke}
+#stage.clash .jobbox{stroke:var(--bad)}
+#side{position:absolute;left:calc(50% + 22px);right:10px;top:4px;bottom:10px;display:flex;flex-direction:column}
+#fname{font-size:22px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#dims{font-size:17px;color:var(--dim);margin-top:2px}
+#dims b{color:var(--text);font-weight:600}
+#cnt{display:flex;align-items:center;margin-top:8px}
+#cnt button{width:56px;height:48px;font-size:28px;line-height:1}
+#cnt span{flex:1;text-align:center;font-size:22px}
+#cnt span b{font-size:30px}
+#warns{flex:1;overflow:hidden;font-size:16px;margin-top:6px}
+.msg{padding:6px 10px;border-radius:8px;background:var(--panel);border-left:4px solid var(--dim);margin-bottom:5px}
+.msg.bad{border-left-color:var(--bad)}.msg.ok{border-left-color:var(--ok)}
+#cut{height:76px;font-size:26px;font-weight:750;letter-spacing:.04em;background:var(--go);color:var(--go-text);border:0}
+#cut.armed{background:var(--bad);color:#fff}
+#stop{height:76px;font-size:26px;font-weight:750;background:var(--bad);color:#fff;border:0}
+#v-login{display:flex;align-items:center;justify-content:center}
+#v-login .l{width:300px;margin-right:40px}
+#dots{font-size:44px;letter-spacing:.2em;min-height:60px;margin-top:10px}
+#pad{width:330px;display:flex;flex-wrap:wrap}
+#pad button{width:100px;height:72px;margin:0 10px 10px 0;font-size:28px}
+#toast{position:absolute;left:20px;right:20px;bottom:16px;padding:14px 18px;border-radius:10px;background:var(--panel);
+border-left:5px solid var(--bad);font-size:19px;box-shadow:0 6px 24px rgba(0,0,0,.5)}
+#toast.ok{border-left-color:var(--ok)}
+</style>
+</head>
+<body>
+<div id="keys">
+  <div class="k" id="k1"><i>1</i><b></b></div>
+  <div class="k" id="k2"><i>2</i><b></b></div>
+  <div class="k" id="k3"><i>3</i><b></b></div>
+  <div class="k" id="k4"><i>4</i><b></b></div>
+  <div class="k m" id="km"><b>STOP</b><i style="margin:0 0 0 6px">M</i></div>
+</div>
+<div id="bar"><span id="pill" class="">Checking</span><span id="vtxt"></span></div>
+<div id="prog"><div id="bar2"></div></div>
+<main>
+  <section id="v-files">
+    <ul id="list"></ul>
+    <div id="empty" hidden></div>
+  </section>
+  <section id="v-job" hidden>
+    <div id="stage"></div>
+    <div id="side">
+      <div id="fname"></div>
+      <div id="dims"></div>
+      <div id="cnt"><button id="minus" aria-label="Fewer copies">&minus;</button><span><b id="cntn">1</b> <span id="cntl">copy</span></span><button id="plus" aria-label="More copies">+</button></div>
+      <div id="warns"></div>
+      <div class="hint" id="jobhint">Dial: copies &middot; Press dial: cut &middot; Back: files</div>
+      <button id="cut" style="margin-top:6px">CUT</button>
+      <button id="stop" style="margin-top:6px" hidden>STOP</button>
+    </div>
+  </section>
+  <section id="v-login" hidden>
+    <div class="l"><div style="font-size:26px;font-weight:650">Enter the PIN</div>
+      <div class="hint">Set in zombiePlot's Settings on your phone.</div><div id="dots"></div></div>
+    <div id="pad"></div>
+  </section>
+</main>
+<div id="toast" hidden></div>
+<script>
+"use strict";
+var $ = function(id){ return document.getElementById(id); };
+var S = {view:"files", files:[], sel:0, id:null, rot:"auto", mirror:false, copies:1, layout:"across", place:"auto",
+         units:"in", status:null, pv:null, arm:null, vjobs:-1, pin:""};
+
+async function api(path, opts){
+  var r;
+  try { r = await fetch(path, opts); }
+  catch(e){ throw new Error("Cannot reach zombiePlot."); }
+  var j = null;
+  try { j = await r.json(); } catch(e){}
+  if(r.status === 401 && j && j.auth){ showLogin(); throw new Error(j.error); }
+  if(!r.ok || (j && j.ok === false)) throw new Error((j && j.error) || ("Error " + r.status));
+  return j;
+}
+function post(path, obj){
+  return api(path, {method:"POST", headers:{"Content-Type":"application/json", "X-ZombiePlot":"1"}, body:JSON.stringify(obj || {})});
+}
+var esc = function(s){ return String(s).replace(/[&<>"]/g, function(c){ return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]; }); };
+var len = function(mm){ return S.units === "mm" ? mm.toFixed(1) + " mm" : (mm/25.4).toFixed(2) + " in"; };
+var num = function(mm){ return S.units === "mm" ? mm.toFixed(0) : (mm/25.4).toFixed(2); };
+var bare = function(n){ return n.replace(/\.svg$/i, ""); };
+
+var toastTimer = 0;
+function toast(msg, good){
+  var t = $("toast"); t.textContent = msg; t.className = good ? "ok" : ""; t.hidden = false;
+  clearTimeout(toastTimer); toastTimer = setTimeout(function(){ t.hidden = true; }, 6000);
+}
+
+/* Press twice within 4 seconds for anything that cuts or forgets vinyl. */
+function armed(what){ return !!(S.arm && S.arm.what === what && Date.now() < S.arm.until); }
+function twice(what, fn){
+  if(!armed(what)){ S.arm = {what:what, until:Date.now() + 4000}; paint(); setTimeout(paint, 4050); return; }
+  S.arm = null; paint(); fn();
+}
+
+function show(view){
+  S.view = view;
+  var vs = ["files", "job", "login"];
+  for(var i = 0; i < vs.length; i++) $("v-" + vs[i]).hidden = vs[i] !== view;
+  paint();
+}
+
+/* ---------- files ---------- */
+function ago(t){
+  var s = Date.now()/1000 - t;
+  if(s < 90) return "just now";
+  if(s < 3600) return Math.round(s/60) + " min";
+  if(s < 86400) return Math.round(s/3600) + " hr";
+  if(s < 86400*14) return Math.round(s/86400) + " days";
+  return new Date(t*1000).toLocaleDateString();
+}
+async function loadFiles(){
+  var keep = S.files[S.sel] ? S.files[S.sel].id : null;
+  try{
+    var r = await api("/api/files");
+    S.files = r.files;
+    S.sel = 0;
+    for(var i = 0; i < S.files.length; i++) if(S.files[i].id === keep) S.sel = i;
+    var ul = $("list"); ul.textContent = "";
+    S.files.forEach(function(f, i){
+      var li = document.createElement("li");
+      li.innerHTML = '<span class="n">' + esc(bare(f.name)) + (f.folder ? '<span class="f">' + esc(f.folder) + '</span>' : '') +
+                     '</span><span class="s">' + ago(f.mtime) + '</span>';
+      li.onclick = function(){ S.sel = i; openFile(); };
+      ul.appendChild(li);
+    });
+    $("empty").hidden = S.files.length > 0;
+    $("empty").textContent = r.library_ok ? "No SVG files yet. Send one from your phone, or save one into " + r.library + "."
+                                          : r.library_message;
+    if(!r.library_ok && S.files.length) toast(r.library_message);
+    paintSel();
+  }catch(e){ if(S.view !== "login") toast(e.message); }
+}
+function paintSel(){
+  var lis = $("list").children;
+  for(var i = 0; i < lis.length; i++) lis[i].className = i === S.sel ? "sel" : "";
+  if(lis[S.sel]) lis[S.sel].scrollIntoView({block:"nearest"});
+}
+function openFile(){
+  var f = S.files[S.sel];
+  if(!f) return;
+  S.id = f.id; S.rot = "auto"; S.mirror = false; S.copies = 1; S.layout = "across"; S.place = "auto"; S.pv = null; S.arm = null;
+  $("fname").textContent = bare(f.name); $("stage").textContent = ""; $("dims").textContent = "Loading"; $("warns").textContent = "";
+  show("job"); refreshPreview();
+}
+
+/* ---------- job ---------- */
+var pvSeq = 0, pvTimer = 0;
+function later(){ clearTimeout(pvTimer); pvTimer = setTimeout(refreshPreview, 250); }
+async function refreshPreview(){
+  if(!S.id) return;
+  var seq = ++pvSeq;
+  if(armed("cut")) S.arm = null;
+  paint();
+  try{
+    var p = await api("/api/preview?id=" + encodeURIComponent(S.id) + "&rot=" + S.rot + "&mirror=" + (S.mirror ? 1 : 0) +
+                      "&copies=" + S.copies + "&layout=" + S.layout + "&place=" + S.place);
+    if(seq !== pvSeq) return;
+    S.pv = p; S.rot = p.rot;
+    if(!p.used.length) S.place = "auto";
+    $("fname").textContent = bare(p.name);
+    draw(p);
+    var u = S.units === "mm" ? " mm" : " in";
+    var t = "<b>" + num(p.w) + " &times; " + num(p.h) + u + "</b> " + (p.copies > 1 ? "each" : "wide &times; long");
+    if(p.copies > 1){
+      var how = p.layout === "stacked" ? "stacked" : p.cols + " across" + (p.rows > 1 ? ", " + p.rows + " rows" : "");
+      t += "<br>All: <b>" + num(p.job_w) + " &times; " + num(p.job_h) + u + "</b> (" + how + ")";
+    }
+    var along = p.base[1], across = p.far ? p.vinyl_width - p.base[0] - p.job_w : p.base[0];
+    t += "<br>" + ((along < 0.05 && across < 0.05) ? (p.far ? "At the right-hand corner" : "At the start point")
+                 : len(across) + " across" + (p.far ? " from the right" : "") + ", " + len(along) + " along");
+    $("dims").innerHTML = t;
+    var notes = p.warnings.map(function(w){ return '<div class="msg' + (p.fits && !(p.clash && w.indexOf("This spot") === 0) ? "" : " bad") + '">' + esc(w) + "</div>"; });
+    if(p.note) notes.push('<div class="msg ok">' + esc(p.note) + "</div>");
+    $("warns").innerHTML = notes.join("");
+  }catch(e){
+    if(seq !== pvSeq) return;
+    S.pv = null; $("stage").textContent = ""; $("dims").textContent = "";
+    $("warns").innerHTML = '<div class="msg bad">' + esc(e.message) + "</div>";
+  }
+  paint();
+}
+function draw(p){
+  var VW = p.vinyl_width, bx = p.base[0], by = p.base[1];
+  var minX = Math.min(0, bx), maxX = Math.max(VW, bx + p.job_w), H = by + p.job_h, i;
+  for(i = 0; i < p.used.length; i++) H = Math.max(H, p.used[i].y + p.used[i].h);
+  var W = maxX - minX, m = Math.max(W, H) * 0.05 + 1, top = H + m;
+  var used = "", uses = "";
+  for(i = 0; i < p.used.length; i++){
+    var q = p.used[i];
+    used += '<rect class="used" x="' + q.x.toFixed(2) + '" y="' + q.y.toFixed(2) + '" width="' + q.w.toFixed(2) + '" height="' + q.h.toFixed(2) + '"/>';
+  }
+  for(i = 0; i < p.offsets.length; i++)
+    uses += '<use href="#one" xlink:href="#one" x="' + (bx + p.offsets[i][0]).toFixed(2) + '" y="' + (by + p.offsets[i][1]).toFixed(2) + '"/>';
+  $("stage").className = p.clash ? "clash" : "";
+  $("stage").innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="' + (minX - m) + " " + (-m) + " " + (W + 2*m) + " " + (top + m) +
+    '" preserveAspectRatio="xMidYMid meet"><g transform="translate(0,' + H + ') scale(1,-1)"><defs><path id="one" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" vector-effect="non-scaling-stroke" d="' + p.d + '"/></defs>' +
+    '<path class="edge" d="M0 ' + top + 'V0H' + VW + 'V' + top + '"/>' + used +
+    '<rect class="jobbox" x="' + bx + '" y="' + by + '" width="' + p.job_w + '" height="' + p.job_h + '"/>' +
+    uses + '<circle class="org" r="' + (Math.max(W, H) * 0.015) + '"/></g></svg>';
+}
+function sending(){ var j = S.status && S.status.job; return !!(j && (j.state === "sending" || j.state === "stopping")); }
+function setCopies(n){
+  n = Math.max(1, Math.min(500, n));
+  if(n === S.copies || sending()) return;
+  S.copies = n; paint(); later();
+}
+async function doCut(){
+  try{
+    await post("/api/cut", {id:S.id, rot:S.rot, mirror:S.mirror, copies:S.copies, layout:S.layout, place:S.place});
+    S.place = "auto";
+    toast("Sending to the plotter.", true);
+  }catch(e){ toast(e.message); }
+  await poll();
+  refreshPreview();
+}
+async function stop(){
+  S.arm = null;
+  try { await post("/api/stop"); toast("Stopping.", true); } catch(e){ toast(e.message); }
+  poll();
+}
+
+/* ---------- the four top buttons ---------- */
+function keyMap(){
+  var v = S.status && S.status.vinyl, busy = sending();
+  if(S.view === "files") return [
+    {label:"Refresh", run:loadFiles},
+    {label:armed("vnew") ? "Press again" : "New vinyl", armed:armed("vnew"), off:busy,
+     run:function(){ twice("vnew", async function(){ try { await post("/api/session/new"); toast("New vinyl: earlier cuts forgotten.", true); } catch(e){ toast(e.message); } poll(); }); }},
+    {label:armed("vundo") ? "Press again" : "Undo last", armed:armed("vundo"), off:busy || !(v && v.jobs),
+     run:function(){ twice("vundo", async function(){ try { await post("/api/session/undo"); toast("Last job's area forgotten.", true); } catch(e){ toast(e.message); } poll(); }); }},
+    null];
+  if(S.view === "job") return [
+    {label:"Rotate " + (S.rot === "auto" ? 0 : S.rot) + "°", off:busy,
+     run:function(){ S.rot = ((S.rot === "auto" ? 0 : S.rot) + 90) % 360; refreshPreview(); }},
+    {label:"Mirror " + (S.mirror ? "on" : "off"), on:S.mirror, off:busy,
+     run:function(){ S.mirror = !S.mirror; refreshPreview(); }},
+    {label:S.layout === "stacked" ? "Stacked" : "Side by side", off:busy || S.copies < 2,
+     run:function(){ S.layout = S.layout === "stacked" ? "across" : "stacked"; refreshPreview(); }},
+    {label:S.place === "origin" ? "Start point" : "Next free", on:S.place === "origin", off:busy || !(S.pv && S.pv.used.length),
+     run:function(){ S.place = S.place === "origin" ? "auto" : "origin"; refreshPreview(); }}];
+  return [null, null, null, null];
+}
+function press(i){
+  var k = keyMap()[i];
+  if(k && !k.off) k.run();
+}
+
+/* ---------- status ---------- */
+function paint(){
+  var st = S.status, job = st && st.job, busy = sending();
+  var pill = $("pill"), cls = "", txt = "Checking";
+  if(!st){ cls = "bad"; txt = "Offline"; }
+  else if(busy){ cls = "ok"; txt = job.state === "stopping" ? "Stopping" : "Sending " + Math.floor(100 * job.sent / Math.max(1, job.total)) + "%"; }
+  else if(st.port.state === "missing"){ cls = "bad"; txt = "No cable"; }
+  else if(st.port.state === "notready"){ cls = "warn"; txt = "Not ready"; }
+  else { cls = "ok"; txt = "Ready"; }
+  pill.className = cls; pill.textContent = txt;
+  var v = st && st.vinyl;
+  if(v){
+    S.units = v.units || S.units;
+    $("vtxt").innerHTML = "<b>" + len(v.width_mm) + "</b> vinyl &middot; " +
+      (v.jobs ? len(v.used_mm) + " used (" + v.jobs + " job" + (v.jobs === 1 ? "" : "s") + ")" : "nothing cut yet");
+  } else $("vtxt").textContent = "";
+  $("bar2").style.width = busy ? (100 * job.sent / Math.max(1, job.total)).toFixed(1) + "%" : "0";
+
+  var keys = keyMap();
+  for(var i = 0; i < 4; i++){
+    var el = $("k" + (i + 1)), k = keys[i];
+    el.className = "k" + (!k ? " empty" : "") + (k && k.on ? " on" : "") + (k && k.armed ? " armed" : "");
+    el.style.opacity = k && k.off ? ".35" : "";
+    el.lastChild.textContent = k ? k.label : "";
+  }
+  $("km").className = "k m" + (busy ? "" : " empty");
+
+  if(S.view === "job"){
+    $("cntn").textContent = S.copies; $("cntl").textContent = S.copies === 1 ? "copy" : "copies";
+    $("minus").disabled = busy || S.copies <= 1; $("plus").disabled = busy || S.copies >= 500;
+    var cut = $("cut"), a = armed("cut");
+    cut.hidden = busy; $("stop").hidden = !busy;
+    cut.disabled = !S.pv || !S.pv.fits || !st;
+    cut.className = a ? "armed" : "";
+    cut.textContent = a ? (S.pv && S.pv.clash ? "OVER USED VINYL - AGAIN" : "PRESS AGAIN TO CUT") : "CUT";
+  }
+}
+async function poll(){
+  if(S.view === "login") return;
+  try { S.status = await api("/api/status"); } catch(e){ S.status = null; }
+  var jobs = S.status && S.status.vinyl ? S.status.vinyl.jobs : -1;
+  if(jobs !== S.vjobs){ var first = S.vjobs === -1; S.vjobs = jobs; if(!first && S.view === "job") refreshPreview(); }
+  paint();
+}
+
+/* ---------- PIN ---------- */
+function showLogin(){
+  if(S.view === "login") return;
+  S.pin = ""; $("dots").textContent = ""; S.status = null;
+  show("login");
+}
+function pinKey(k){
+  if(k === "del") S.pin = S.pin.slice(0, -1);
+  else if(k === "ok"){ unlock(); return; }
+  else if(S.pin.length < 64) S.pin += k;
+  $("dots").textContent = new Array(S.pin.length + 1).join("•");
+}
+async function unlock(){
+  try { await post("/api/login", {pin:S.pin}); }
+  catch(e){ S.pin = ""; $("dots").textContent = ""; toast(e.message); return; }
+  S.pin = ""; S.view = ""; show("files"); loadFiles(); poll();
+}
+["1","2","3","4","5","6","7","8","9","del","0","ok"].forEach(function(k){
+  var b = document.createElement("button");
+  b.textContent = k === "del" ? "⌫" : k === "ok" ? "OK" : k;
+  if(k === "ok"){ b.style.background = "var(--go)"; b.style.color = "var(--go-text)"; b.style.border = "0"; }
+  b.onclick = function(){ pinKey(k); };
+  $("pad").appendChild(b);
+});
+
+/* ---------- Car Thing controls (and a keyboard, for trying it on a computer) ---------- */
+function turn(d){
+  if(S.view === "files" && S.files.length){ S.sel = Math.max(0, Math.min(S.files.length - 1, S.sel + d)); paintSel(); }
+  else if(S.view === "job") setCopies(S.copies + d);
+}
+function enter(){
+  if(S.view === "files") openFile();
+  else if(S.view === "job" && !sending() && S.pv && S.pv.fits) twice("cut", doCut);
+  else if(S.view === "login") unlock();
+}
+function back(){
+  if(S.view === "job"){ S.arm = null; S.id = null; S.pv = null; show("files"); loadFiles(); }
+  else if(S.view === "login") pinKey("del");
+}
+document.addEventListener("keydown", function(e){
+  var k = e.key || "", c = e.code || "";
+  if(S.view === "login" && /^[0-9]$/.test(k)){ pinKey(k); e.preventDefault(); return; }
+  var n = /^Digit[1-4]$/.test(c) ? +c.slice(5) : /^[1-4]$/.test(k) ? +k : 0;
+  if(n){ press(n - 1); }
+  else if(c === "KeyM" || k === "m" || k === "M"){ if(sending()) stop(); }
+  else if(k === "Escape" || k === "Backspace" || k === "BrowserBack") back();
+  else if(k === "Enter" || k === " ") enter();
+  else if(k === "ArrowDown" || k === "ArrowRight") turn(1);
+  else if(k === "ArrowUp" || k === "ArrowLeft") turn(-1);
+  else return;
+  e.preventDefault();
+});
+var wheelAt = 0;
+document.addEventListener("wheel", function(e){
+  e.preventDefault();
+  var d = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+  var now = Date.now();
+  if(!d || now - wheelAt < 40) return;      /* a mouse or trackpad sends bursts; the dial sends one per click */
+  wheelAt = now;
+  turn(d > 0 ? 1 : -1);
+}, {passive:false});
+for(var i = 1; i <= 4; i++) (function(n){ $("k" + n).onclick = function(){ press(n - 1); }; })(i);
+$("km").onclick = function(){ if(sending()) stop(); };
+$("minus").onclick = function(){ setCopies(S.copies - 1); };
+$("plus").onclick = function(){ setCopies(S.copies + 1); };
+$("cut").onclick = function(){ if(S.pv && S.pv.fits) twice("cut", doCut); };
+$("stop").onclick = stop;
+
+loadFiles(); poll();
+setInterval(poll, 1000);
+setInterval(function(){ if(S.view === "files") loadFiles(); }, 30000);
+</script>
+</body>
+</html>
+"""
+
+
 def main():
     env = os.environ.get
     ap = argparse.ArgumentParser(description="zombiePlot: phone control for Roland CAMM-1 vinyl cutters")
@@ -2633,7 +3195,14 @@ def main():
     ap.add_argument("--updater", action="store_true", help="act on an update request (run as root)")
     ap.add_argument("--auto", action="store_true", help="with --updater: nightly automatic update")
     ap.add_argument("--clear-pin", action="store_true", help="remove the access PIN (run as the zombieplot user)")
+    ap.add_argument("--car-thing", action="store_true",
+                    help="run the Car Thing remote: forwards a USB-connected Car Thing to the web page (run as root)")
+    ap.add_argument("--car-thing-restore", action="store_true",
+                    help="put back the Car Thing's earlier screen (run as root, Car Thing plugged in)")
     args = ap.parse_args()
+    if args.car_thing or args.car_thing_restore:
+        run_car_thing(args.port, restore=args.car_thing_restore)
+        return
     if args.clear_pin:
         Config(os.path.join(args.data, "config.json")).update({"pin_hash": ""})
         try:

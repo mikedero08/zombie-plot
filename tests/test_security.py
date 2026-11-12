@@ -72,6 +72,11 @@ try:
     check("locked without cookie", c == 401 and j.get("auth") is True)
     with urllib.request.urlopen(BASE + "/", timeout=10) as r:
         check("page itself still loads (shows unlock screen)", r.status == 200 and b"v-login" in r.read())
+    car = urllib.request.Request(BASE + "/thing", headers={"Host": "localhost:%d" % P.CAR_THING_PORT})
+    with urllib.request.urlopen(car, timeout=10) as r:
+        check("Car Thing page loads through adb's localhost name (shows its PIN pad)", r.status == 200 and b"v-login" in r.read())
+    c, j, _ = req("GET", "/api/files", headers={"Host": "localhost:%d" % P.CAR_THING_PORT})
+    check("Car Thing still needs the PIN for data", c == 401 and j.get("auth") is True)
     c, j, _ = req("GET", "/api/files", headers={"Cookie": tok})
     check("cookie unlocks", c == 200)
     c, j, _ = req("POST", "/api/cut", {"id": "lib:a.svg"}, OK)
