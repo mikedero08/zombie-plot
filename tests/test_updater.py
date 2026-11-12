@@ -26,6 +26,8 @@ check("version order", P.parse_version("1.10") > P.parse_version("1.9") > P.pars
 check("odd version text", P.parse_version("junk") == (0,))
 latest({"version": "9.1", "tag": "v9.1", "notes": "x"})
 check("reads latest.json", P.latest_release() == {"version": "9.1", "tag": "v9.1", "notes": "x"})
+latest({"version": "9.2", "ref": "94e8878f0c3c1d2e4b5a69788796a5b4c3d2e1f0"})
+check("ref (commit) preferred over tag", P.latest_release()["tag"] == "94e8878f0c3c1d2e4b5a69788796a5b4c3d2e1f0")
 for bad in ('{"version": "9.1; rm -rf", "tag": "v9"}', '{"version": "9.1", "tag": "../../etc"}', '[1,2]', 'not json'):
     latest(bad)
     try:

@@ -1526,7 +1526,7 @@ def fmt_len(mm, cfg):
 
 
 # ----------------------------------------------------------------------------
-# Updates (from tagged releases of the GitHub repository)
+# Updates (from releases named in latest.json on the GitHub repository)
 # ----------------------------------------------------------------------------
 
 UPDATE_REPO = os.environ.get("ZOMBIEPLOT_REPO", "mikedero08/zombie-plot")
@@ -1565,8 +1565,9 @@ def latest_release():
         raise UpdateError("Could not reach GitHub to check for updates (%s)." % e)
     if not isinstance(info, dict):
         raise UpdateError("The update information on GitHub is not readable.")
-    ver, tag = str(info.get("version", "")), str(info.get("tag", ""))
-    if not re.match(r"^\d+(\.\d+){0,3}$", ver) or not re.match(r"^[A-Za-z0-9._-]{1,40}$", tag):
+    # "ref" is the release commit (preferred, it cannot move); "tag" is accepted too.
+    ver, tag = str(info.get("version", "")), str(info.get("ref") or info.get("tag") or "")
+    if not re.match(r"^\d+(\.\d+){0,3}$", ver) or not re.match(r"^[A-Za-z0-9._-]{1,64}$", tag):
         raise UpdateError("The update information on GitHub is not readable.")
     return {"version": ver, "tag": tag, "notes": str(info.get("notes", ""))[:2000]}
 

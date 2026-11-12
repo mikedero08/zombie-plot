@@ -14,7 +14,7 @@ RAW="${ZOMBIEPLOT_RAW_BASE:-https://raw.githubusercontent.com}/$REPO"
 command -v python3 >/dev/null || { apt-get update && apt-get install -y python3; }
 
 echo "Finding the newest zombiePlot release..."
-TAG="$(curl -fsSL "$RAW/main/latest.json" | python3 -c 'import json, sys; print(json.load(sys.stdin)["tag"])')" \
+TAG="$(curl -fsSL "$RAW/main/latest.json" | python3 -c 'import json, sys; d = json.load(sys.stdin); print(d.get("ref") or d["tag"])')" \
     || { echo "Could not read the release information from GitHub. Check this Pi is online." >&2; exit 1; }
 case "$TAG" in *[!A-Za-z0-9._-]*|"") echo "Unexpected release name: $TAG" >&2; exit 1 ;; esac
 
@@ -23,7 +23,7 @@ trap 'rm -rf "$TMP"' EXIT
 for f in zombieplot.py install.sh; do
     curl -fsSL -o "$TMP/$f" "$RAW/$TAG/$f" || { echo "Download of $f failed." >&2; exit 1; }
 done
-echo "Downloaded $TAG."
+echo "Downloaded release ${TAG:0:12}."
 
 cd "$TMP"
 # Answers to the installer's questions come from the keyboard, not from this pipe.

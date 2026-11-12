@@ -211,7 +211,7 @@ Open **Settings**. The **Updates** section shows the installed version.
 - **Install updates automatically** does the same overnight, between 3:00 and 4:30. It never updates while a job is being sent.
 - **Go back to version …** puts the previous version back if a new one misbehaves.
 
-Only tagged releases are offered, never half-finished changes. If a download is damaged or fails its self-test, it isn't installed and the old version keeps running.
+Only published releases are offered, never half-finished changes. If a download is damaged or fails its self-test, it isn't installed and the old version keeps running.
 
 The updater needs the Pi to reach `raw.githubusercontent.com`. To update by hand instead, log in and run the one-line installer from Step 4 again.
 
@@ -294,7 +294,7 @@ for t in geometry placement updater server parallel; do python3 tests/test_$t.py
 To publish a release:
 
 1. Set `VERSION` in `zombieplot.py` (for example `"1.3"`) and commit.
-2. Tag that commit and push the tag: `git tag v1.3 && git push origin v1.3`.
-3. Then update `latest.json` on `main` to `{"version": "1.3", "tag": "v1.3", "notes": "..."}` and push.
+2. In a second commit, set `latest.json` to `{"version": "1.3", "ref": "<full hash of the first commit>", "notes": "..."}`.
+3. Push both commits together.
 
-Pis read `latest.json` from `main` and download `zombieplot.py` and `install.sh` from the tag it names. The tag must exist before `latest.json` points at it, and the version in `latest.json` must match `VERSION` in the tagged file, or the updater refuses it.
+Pis read `latest.json` from `main` and download `zombieplot.py` and `install.sh` from the commit it names. A commit can't be changed after the fact, so a release can't shift under anyone. The version in `latest.json` must match `VERSION` in that commit's file, or the updater refuses it. A tag name works in place of `ref` too (`"tag": "v1.3"`).
