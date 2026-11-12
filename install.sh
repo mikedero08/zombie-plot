@@ -106,8 +106,8 @@ if [ -f "$PROG/$APP.py" ] && ! cmp -s "$PROG/$APP.py" "$HERE/$APP.py"; then
     cp -p "$PROG/$APP.py" "$PROG/previous/$APP.py"
     [ -f "$PROG/install.sh" ] && cp -p "$PROG/install.sh" "$PROG/previous/install.sh"
 fi
-install -m 644 "$HERE/$APP.py" "$PROG/$APP.py"
-if [ "$HERE" != "$PROG" ]; then
+if [ "$HERE" != "$PROG" ]; then         # run again from /opt/zombieplot: files are already in place
+    install -m 644 "$HERE/$APP.py" "$PROG/$APP.py"
     install -m 644 "$HERE/install.sh" "$PROG/install.sh"
 fi
 echo "Version $NEWVER is in $PROG, settings in $DATA."

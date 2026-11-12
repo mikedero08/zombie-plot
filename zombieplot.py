@@ -37,7 +37,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.4"
+VERSION = "1.4.1"
 UNITS_PER_MM = 40.0          # CAMM-GL III step = 0.025 mm
 FLATTEN_TOL_MM = 0.03        # curve-to-line tolerance (about one cutter step)
 MAX_UPLOAD = 25 * 1024 * 1024
