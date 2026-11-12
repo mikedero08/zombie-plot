@@ -15,12 +15,17 @@ import argparse
 import errno
 import fcntl
 import glob
+import hashlib
+import hmac
+import ipaddress
 import json
 import math
 import os
 import re
 import select
+import secrets
 import shutil
+import socket
 import struct
 import subprocess
 import sys
@@ -32,7 +37,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.2"
+VERSION = "1.3"
 UNITS_PER_MM = 40.0          # CAMM-GL III step = 0.025 mm
 FLATTEN_TOL_MM = 0.03        # curve-to-line tolerance (about one cutter step)
 MAX_UPLOAD = 25 * 1024 * 1024
@@ -62,8 +67,13 @@ DEFAULTS = {
     "units": "in",             # display units: in | mm
     "init": "IN;PA;",
     "auto_update": False,
+    "pin_hash": "",            # set through /api/pin only
     "steps_per_mm": 40.0,      # plotter units per mm (HP-GL / Roland CAMM-GL: 40)
 }
+
+
+def _raise():
+    raise ValueError("not valid")
 
 
 def _num(lo, hi):
@@ -123,6 +133,7 @@ VALIDATORS = {
     "units": _choice("in", "mm"),
     "init": _init,
     "auto_update": _bool,
+    "pin_hash": lambda v: str(v) if re.match(r"^(|pbkdf2\$\d+\$[0-9a-f]+\$[0-9a-f]+)$", str(v)) else _raise(),
 }
 
 
@@ -1274,6 +1285,7 @@ class App:
         self.jobs = Jobs(self.port)
         self.session = Session(os.path.join(data_dir, "session.json"))
         self.updates = UpdateState(data_dir)
+        self.auth = Auth(self.cfg, data_dir)
         self.cache = {}
         self.cache_lock = threading.Lock()
 
@@ -1600,16 +1612,26 @@ class UpdateState:
             return {}
 
     def save(self, **changes):
+        # The root helper writes here too, in a folder the service account owns. A fresh
+        # randomly named file plus rename never follows a link planted in that folder.
         with self.lock:
             d = self.load()
             d.update(changes)
-            tmp = self.path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(d, f)
-            if hasattr(os, "geteuid") and os.geteuid() == 0:
-                st = os.stat(self.data_dir)
-                os.chown(tmp, st.st_uid, st.st_gid)
-            os.replace(tmp, self.path)
+            fd, tmp = tempfile.mkstemp(dir=self.data_dir, prefix=".update-status.")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(d, f)
+                if hasattr(os, "geteuid") and os.geteuid() == 0:
+                    st = os.stat(self.data_dir)
+                    os.chown(tmp, st.st_uid, st.st_gid)
+                os.chmod(tmp, 0o644)
+                os.replace(tmp, self.path)
+            except BaseException:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                raise
             return d
 
 
@@ -1728,6 +1750,125 @@ def selftest():
 
 
 # ----------------------------------------------------------------------------
+# Access PIN (optional)
+# ----------------------------------------------------------------------------
+
+PIN_ROUNDS = 20000
+COOKIE = "zp_session"
+
+
+def hash_pin(pin, salt=None, rounds=PIN_ROUNDS):
+    salt = salt or secrets.token_hex(16)
+    h = hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), bytes.fromhex(salt), rounds).hex()
+    return "pbkdf2$%d$%s$%s" % (rounds, salt, h)
+
+
+def check_pin(pin, stored):
+    try:
+        _, rounds, salt, _h = stored.split("$")
+        return hmac.compare_digest(hash_pin(pin, salt, int(rounds)), stored)
+    except (ValueError, TypeError):
+        return False
+
+
+class Auth:
+    """Without a PIN the page is open to anyone on the network. With one, each browser
+    unlocks once and keeps a long-lived session cookie."""
+
+    def __init__(self, cfg, data_dir):
+        self.cfg = cfg
+        self.path = os.path.join(data_dir, "sessions.json")
+        self.lock = threading.Lock()
+        self.fails = 0
+        self.locked_until = 0.0
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                self.tokens = set(t for t in json.load(f) if isinstance(t, str))
+        except (OSError, ValueError, TypeError):
+            self.tokens = set()
+
+    def enabled(self):
+        return bool(self.cfg.get("pin_hash"))
+
+    @staticmethod
+    def _digest(token):
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def _save(self):
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(self.path), prefix=".sessions.")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(sorted(self.tokens), f)
+        os.replace(tmp, self.path)
+
+    def ok(self, cookie_header):
+        if not self.enabled():
+            return True
+        token = None
+        for part in (cookie_header or "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == COOKIE:
+                token = v
+        with self.lock:
+            return bool(token) and self._digest(token) in self.tokens
+
+    def _new_token(self):
+        token = secrets.token_urlsafe(32)
+        self.tokens.add(self._digest(token))
+        if len(self.tokens) > 200:
+            self.tokens = set(sorted(self.tokens)[-200:])
+        self._save()
+        return token
+
+    def login(self, pin):
+        with self.lock:
+            now = time.time()
+            if now < self.locked_until:
+                raise UserError("Too many wrong tries. Wait %d seconds." % int(self.locked_until - now + 1))
+            if not check_pin(str(pin), self.cfg.get("pin_hash")):
+                self.fails += 1
+                if self.fails >= 5:
+                    self.locked_until = now + min(900, 30 * 2 ** (self.fails - 5))
+                raise UserError("Wrong PIN.")
+            self.fails = 0
+            return self._new_token()
+
+    def set_pin(self, pin):
+        pin = str(pin or "")
+        if pin and not (4 <= len(pin) <= 64):
+            raise UserError("Use 4 to 64 characters.")
+        with self.lock:
+            self.cfg.update({"pin_hash": hash_pin(pin) if pin else ""})
+            self.tokens = set()
+            token = self._new_token() if pin else None
+            self._save()
+            return token
+
+
+def host_allowed(host):
+    """Defends against DNS rebinding: a web page on the internet pointing its own domain
+    at this box. Allows addresses, local names, and names listed in ZOMBIEPLOT_ALLOWED_HOSTS."""
+    if not host:
+        return True
+    host = host.strip().lower()
+    if host.startswith("["):
+        host = host[1:].split("]", 1)[0]
+    elif host.count(":") == 1:
+        host = host.split(":", 1)[0]
+    host = host.rstrip(".")
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    if host == "localhost" or "." not in host:
+        return True
+    if host.endswith((".local", ".lan", ".home", ".home.arpa", ".internal", ".localdomain", ".localhost")):
+        return True
+    extra = [h.strip().lower() for h in os.environ.get("ZOMBIEPLOT_ALLOWED_HOSTS", "").split(",") if h.strip()]
+    return host in extra or host == socket.gethostname().lower()
+
+
+# ----------------------------------------------------------------------------
 # Web server
 # ----------------------------------------------------------------------------
 
@@ -1750,8 +1891,20 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, obj, code=200):
         self._send(code, json.dumps(obj).encode("utf-8"), "application/json")
 
-    def _fail(self, msg, code=400):
-        self._json({"ok": False, "error": msg}, code)
+    def _fail(self, msg, code=400, **extra):
+        self._json(dict({"ok": False, "error": msg}, **extra), code)
+
+    def _json_cookie(self, obj, token):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if token:
+            self.send_header("Set-Cookie", "%s=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000"
+                             % (COOKIE, token))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _body(self):
         try:
@@ -1779,6 +1932,16 @@ class Handler(BaseHTTPRequestHandler):
         q = {k: v[0] for k, v in parse_qs(url.query).items()}
         path = url.path
         try:
+            if not host_allowed(self.headers.get("Host")):
+                return self._fail("Blocked: this page was opened through an unexpected name. Use the box's "
+                                  "IP address or .local name, or add the name to ZOMBIEPLOT_ALLOWED_HOSTS.", 403)
+            if method == "POST" and self.headers.get("X-ZombiePlot") != "1":
+                # Browsers cannot add this header on requests from other websites.
+                return self._fail("Blocked: this request did not come from the zombiePlot page.", 403)
+            public = path in ("/", "/index.html", "/manifest.json", "/icon.svg", "/api/login")
+            local_status = path == "/api/status" and self.client_address[0] in ("127.0.0.1", "::1")
+            if not (public or local_status or app.auth.ok(self.headers.get("Cookie"))):
+                return self._fail("Enter the PIN to use this page.", 401, auth=True)
             if method == "GET":
                 if path in ("/", "/index.html"):
                     return self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
@@ -1795,12 +1958,25 @@ class Handler(BaseHTTPRequestHandler):
                 if path == "/api/update":
                     return self._json(app.update_info())
                 if path == "/api/settings":
-                    return self._json({"settings": app.cfg.snapshot(), "library": app.library,
+                    snap = app.cfg.snapshot()
+                    snap.pop("pin_hash", None)
+                    return self._json({"settings": snap, "library": app.library, "pin_set": app.auth.enabled(),
                                        "device": app.port.device(), "version": VERSION})
             elif method == "POST":
                 if path == "/api/upload":
                     return self._json({"ok": True, "id": app.save_upload(q.get("name"), self._body())})
                 body = self._json_body()
+                if path == "/api/login":
+                    if not app.auth.enabled():
+                        return self._json({"ok": True})
+                    try:
+                        token = app.auth.login(body.get("pin", ""))
+                    except UserError as e:
+                        return self._fail(str(e), 401 if "Wrong" in str(e) else 429)
+                    return self._json_cookie({"ok": True}, token)
+                if path == "/api/pin":
+                    token = app.auth.set_pin(body.get("pin", ""))
+                    return self._json_cookie({"ok": True, "pin_set": bool(token)}, token)
                 if path == "/api/cut":
                     return self._json(dict(app.cut(body), ok=True))
                 if path == "/api/update/check":
@@ -1819,8 +1995,11 @@ class Handler(BaseHTTPRequestHandler):
                     app.jobs.request_stop()
                     return self._json({"ok": True})
                 if path == "/api/settings":
+                    body.pop("pin_hash", None)
                     try:
-                        return self._json({"ok": True, "settings": app.cfg.update(body)})
+                        saved = app.cfg.update(body)
+                        saved.pop("pin_hash", None)
+                        return self._json({"ok": True, "settings": saved})
                     except ValueError as e:
                         raise UserError(str(e))
             self._fail("Not found.", 404)
@@ -1946,6 +2125,14 @@ h2{font-size:15px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)
   <button id="vnew">New vinyl</button>
 </div>
 
+<main id="v-login" hidden>
+  <h2>Locked</h2>
+  <p class="note">Enter the PIN for this plotter.</p>
+  <label class="f">PIN<input id="pin" type="password" autocomplete="current-password"></label>
+  <div id="loginmsg" class="msg bad" hidden></div>
+  <button id="unlock" class="wide" style="margin-top:12px;border-color:var(--go);color:var(--go);font-weight:650">Unlock</button>
+</main>
+
 <main id="v-files">
   <button id="upnote" class="msg ok wide" style="justify-content:flex-start;text-align:left" hidden></button>
   <label class="btn wide"><input id="up" type="file" accept=".svg,image/svg+xml" hidden>Send a file from this device</label>
@@ -1996,6 +2183,14 @@ h2{font-size:15px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)
   <label class="c"><input type="checkbox" id="s-auto">Install updates automatically (overnight, never during a cut)</label>
   <button id="up-back" class="small wide" hidden>Go back to the previous version</button>
 
+  <h2>Access</h2>
+  <p id="pin-info" class="note"></p>
+  <label class="f">New PIN (4 or more characters)<input id="s-pin" type="password" autocomplete="new-password"></label>
+  <div class="row">
+    <button id="pin-set">Set PIN</button>
+    <button id="pin-clear">Remove PIN</button>
+  </div>
+
   <h2>Vinyl</h2>
   <label class="f"><span id="l-vw">Usable vinyl width</span><input id="s-vw" inputmode="decimal"></label>
   <p class="note">How far across the plotter can cut on the vinyl loaded now. Change it when you load a different width.</p>
@@ -2037,10 +2232,28 @@ async function api(path, opts){
   catch(e){ throw new Error("Cannot reach the zombiePlot box. Check that it has power and Wi-Fi."); }
   let j = null;
   try { j = await r.json(); } catch(e){}
+  if(r.status === 401 && j && j.auth){ showLogin(); throw new Error(j.error); }
   if(!r.ok || (j && j.ok === false)) throw new Error((j && j.error) || ("Error " + r.status));
   return j;
 }
-const post = (path, obj) => api(path, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(obj||{})});
+const post = (path, obj) => api(path, {method:"POST", headers:{"Content-Type":"application/json", "X-ZombiePlot":"1"}, body:JSON.stringify(obj||{})});
+
+function showLogin(){
+  if(S.view === "login") return;
+  S.view = "login";
+  for(const v of ["files","job","set"]) $("v-"+v).hidden = true;
+  $("v-login").hidden = false; $("vbar").hidden = true; $("back").hidden = true; $("gear").hidden = true; $("pill").hidden = true;
+  $("title").textContent = "zombiePlot";
+  setTimeout(() => $("pin").focus(), 50);
+}
+
+async function unlock(){
+  const box = $("loginmsg"); box.hidden = true;
+  try { await post("/api/login", {pin: $("pin").value}); }
+  catch(e){ box.textContent = e.message; box.hidden = false; return; }
+  $("pin").value = ""; $("v-login").hidden = true; S.view = "";
+  show("files"); try { await loadSettings(); } catch(e){} loadFiles(); poll();
+}
 const len = mm => S.units === "mm" ? mm.toFixed(1) + " mm" : (mm/25.4).toFixed(2) + " in";
 const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const unit = () => S.units === "mm" ? 1 : 25.4;
@@ -2048,6 +2261,7 @@ const unit = () => S.units === "mm" ? 1 : 25.4;
 function show(view){
   S.view = view;
   for(const v of ["files","job","set"]) $("v-"+v).hidden = v !== view;
+  $("v-login").hidden = true; $("pill").hidden = false;
   $("back").hidden = view === "files";
   $("gear").hidden = view === "set";
   $("vbar").hidden = view === "set";
@@ -2214,6 +2428,7 @@ function pillDetail(){
 }
 
 async function poll(){
+  if(S.view === "login") return;
   try { S.status = await api("/api/status"); } catch(e){ S.status = null; }
   if(S.armed && Date.now() > S.armed) S.armed = 0;
   const jobs = S.status && S.status.vinyl ? S.status.vinyl.jobs : -1;
@@ -2247,6 +2462,9 @@ async function loadSettings(){
   $("s-swap").checked = s.swap_axes; $("s-mc").checked = s.mirror_carriage; $("s-mf").checked = s.mirror_feed;
   $("s-link").value = s.link; $("s-flow").value = s.flow; $("s-baud").value = s.baud; $("s-port").value = s.port;
   $("s-ppi").value = s.px_per_inch; $("s-upm").value = s.steps_per_mm;
+  $("pin-info").textContent = r.pin_set ? "A PIN is set. Each phone or computer asks for it once."
+    : "No PIN. Anyone on your network can use this page. Set a PIN if others share your network.";
+  $("pin-clear").hidden = !r.pin_set;
   $("info").textContent = "Files folder: " + r.library + " · Cable: " + (r.device || "not found") + " · Version " + r.version;
 }
 
@@ -2315,6 +2533,18 @@ function setMsg(text, ok){ const b = $("setmsg"); b.textContent = text; b.classN
 $("back").onclick = () => { show("files"); loadFiles(); };
 $("gear").onclick = async () => { setMsg(""); try { await loadSettings(); show("set"); loadUpdates(); } catch(e){ alert(e.message); } };
 $("upnote").onclick = () => $("gear").onclick();
+$("unlock").onclick = unlock;
+$("pin").onkeydown = ev => { if(ev.key === "Enter") unlock(); };
+$("pin-set").onclick = async () => {
+  const v = $("s-pin").value;
+  if(v.length < 4){ setMsg("Use at least 4 characters for the PIN.", false); return; }
+  try { await post("/api/pin", {pin: v}); $("s-pin").value = ""; await loadSettings(); setMsg("PIN set. Other phones and computers will be asked for it.", true); }
+  catch(e){ setMsg(e.message, false); }
+};
+$("pin-clear").onclick = async () => {
+  if(!confirm("Remove the PIN? Anyone on your network will be able to use this page.")) return;
+  try { await post("/api/pin", {pin: ""}); await loadSettings(); setMsg("PIN removed.", true); } catch(e){ setMsg(e.message, false); }
+};
 $("up-check").onclick = async () => {
   $("up-check").disabled = true; $("up-info").textContent = "Checking GitHub.";
   try { S.update = await post("/api/update/check"); } catch(e){ await loadUpdates(); $("up-msg").hidden = false; $("up-msg").className = "msg bad"; $("up-msg").textContent = e.message; $("up-check").disabled = false; return; }
@@ -2373,7 +2603,7 @@ $("up").onchange = async ev => {
   const f = ev.target.files[0]; ev.target.value = "";
   if(!f) return;
   try{
-    const r = await api("/api/upload?name=" + encodeURIComponent(f.name), {method:"POST", body:f});
+    const r = await api("/api/upload?name=" + encodeURIComponent(f.name), {method:"POST", headers:{"X-ZombiePlot":"1"}, body:f});
     openFile(r.id);
   }catch(e){ $("libmsg").hidden = false; $("libmsg").textContent = e.message; }
 };
@@ -2402,7 +2632,16 @@ def main():
     ap.add_argument("--selftest", action="store_true", help="check this copy works, print its version")
     ap.add_argument("--updater", action="store_true", help="act on an update request (run as root)")
     ap.add_argument("--auto", action="store_true", help="with --updater: nightly automatic update")
+    ap.add_argument("--clear-pin", action="store_true", help="remove the access PIN (run as the zombieplot user)")
     args = ap.parse_args()
+    if args.clear_pin:
+        Config(os.path.join(args.data, "config.json")).update({"pin_hash": ""})
+        try:
+            os.remove(os.path.join(args.data, "sessions.json"))
+        except OSError:
+            pass
+        print("PIN removed. Restart with: sudo systemctl restart zombieplot")
+        return
     if args.selftest:
         selftest()
         return

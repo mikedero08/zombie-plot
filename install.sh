@@ -99,7 +99,7 @@ id $APP >/dev/null 2>&1 || useradd --system --home-dir "$DATA" --shell /usr/sbin
 usermod -aG dialout,lp $APP     # lp: parallel cable (/dev/usb/lp0), dialout: serial cable
 install -d -m 755 "$DATA"
 install -d -m 755 "$DATA/uploads" "$DATA/files"
-chown -R $APP:$APP "$DATA"
+chown -R -h $APP:$APP "$DATA"
 
 install -d -m 755 "$PROG" "$PROG/previous"
 if [ -f "$PROG/$APP.py" ] && ! cmp -s "$PROG/$APP.py" "$HERE/$APP.py"; then
@@ -206,7 +206,9 @@ fi
 # ---------------------------------------------------------------- 5. service
 say "5/7  Setting it to start on every boot"
 OLDPORT=""
+ALLOWED=""
 [ -f "$ENVFILE" ] && OLDPORT="$(sed -n 's/^ZOMBIEPLOT_HTTP_PORT=//p' "$ENVFILE" | tail -n 1)"
+[ -f "$ENVFILE" ] && ALLOWED="$(sed -n 's/^ZOMBIEPLOT_ALLOWED_HOSTS=//p' "$ENVFILE" | tail -n 1)"
 systemctl stop $APP.service 2>/dev/null || true
 HTTP_PORT="${OLDPORT:-80}"
 if [ -z "$OLDPORT" ] && command -v ss >/dev/null && ss -ltn 2>/dev/null | grep -qE '[:.]80[[:space:]]'; then
@@ -214,6 +216,7 @@ if [ -z "$OLDPORT" ] && command -v ss >/dev/null && ss -ltn 2>/dev/null | grep -
     echo "Something else on this machine already uses web port 80, so zombiePlot will use 8080."
 fi
 printf 'ZOMBIEPLOT_LIBRARY=%s\nZOMBIEPLOT_HTTP_PORT=%s\n' "$LIB" "$HTTP_PORT" > "$ENVFILE"
+[ -z "$ALLOWED" ] || printf 'ZOMBIEPLOT_ALLOWED_HOSTS=%s\n' "$ALLOWED" >> "$ENVFILE"
 cat > "$UNIT" <<EOF
 [Unit]
 Description=zombiePlot vinyl cutter controller

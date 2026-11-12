@@ -12,7 +12,7 @@ def getj(p):
         with urllib.request.urlopen(BASE + p, timeout=10) as r: return r.status, json.loads(r.read())
     except urllib.error.HTTPError as e: return e.code, json.loads(e.read())
 def post(p, o=None):
-    req = urllib.request.Request(BASE + p, data=json.dumps(o or {}).encode(), method="POST")
+    req = urllib.request.Request(BASE + p, data=json.dumps(o or {}).encode(), method="POST", headers={"X-ZombiePlot": "1"})
     try:
         with urllib.request.urlopen(req, timeout=10) as r: return r.status, json.loads(r.read())
     except urllib.error.HTTPError as e: return e.code, json.loads(e.read())

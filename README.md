@@ -15,6 +15,7 @@ A small Raspberry Pi sits next to the cutter and stays switched on. You open a w
 - Can start jobs from either edge of the vinyl.
 - Cut and Stop buttons, plus a test square for checking orientation.
 - Updates itself from this repository, from the Settings page or automatically overnight.
+- Optional PIN, so only people who know it can use the cutter.
 
 **Files in this repository**
 
@@ -164,6 +165,7 @@ All positions are measured from the cutter's start point (origin). The page move
 
 | Setting | What it does | Starts at |
 |---|---|---|
+| Access PIN | Without a PIN, anyone on your network can use the page. With one, each phone or computer asks for it once. | none |
 | Usable vinyl width | Same as Width on the vinyl bar. | Plotter width |
 | Start jobs from | The start point side of the vinyl, or the far side. With the far side, jobs sit against the opposite edge. Uses the vinyl width, so keep that accurate. | Start point side |
 | Gap between copies and jobs | Space left between copies and between jobs. | 5 mm |
@@ -255,6 +257,16 @@ ls -l /dev/usb/ /dev/serial/by-id/
 
 **The file list says it can't read the folder.** The server or share is offline. Files sent from the phone still work.
 
+**Forgot the PIN.** Log in to the Pi and run these two lines:
+```
+sudo -u zombieplot python3 /opt/zombieplot/zombieplot.py --clear-pin --data /var/lib/zombieplot
+```
+```
+sudo systemctl restart zombieplot
+```
+
+**The page says "Blocked: this page was opened through an unexpected name".** zombiePlot only answers to IP addresses and local names (`.local`, `.lan`, `.home`, `.home.arpa`, `.internal`, or a name without dots). This stops websites on the internet from reaching it through your browser. If you use your own name for it, add that name to `/etc/default/zombieplot` as `ZOMBIEPLOT_ALLOWED_HOSTS=plotter.example.com` (separate several with commas), then run `sudo systemctl restart zombieplot`.
+
 **An update failed.** Settings shows the reason, and the old version keeps running. Logs from the updater:
 ```
 sudo journalctl -u zombieplot-update -n 50
@@ -264,6 +276,19 @@ sudo journalctl -u zombieplot-update -n 50
 ```
 sudo bash /opt/zombieplot/install.sh --uninstall
 ```
+
+---
+
+## Security
+
+zombiePlot is built for a home or shop network. See [SECURITY.md](SECURITY.md) for the details. In short:
+
+- **Keep it on your local network.** Never forward a port to it from your router.
+- **Set a PIN** (Settings → Access) if people you don't trust share your network.
+- **Other websites can't reach it.** Pages you visit on the internet can't control it through your browser: it ignores requests from other sites and from unexpected host names.
+- **The web page has no special access.** It runs as its own user, with access only to the plotter cable and its own folder.
+- **Updates are opt-in and checked.** They only come from this repository over HTTPS, and nothing installs automatically unless you switch that on. Each download is self-tested before it's used.
+- **Use a strong password for the Pi** and keep the system updated (`sudo apt update && sudo apt full-upgrade`).
 
 ---
 
@@ -288,7 +313,7 @@ sudo bash /opt/zombieplot/install.sh --uninstall
 Run the tests (Python 3.9+, standard library only; `test_ui.py` also needs Playwright with Chromium):
 
 ```
-for t in geometry placement updater server parallel; do python3 tests/test_$t.py; done
+for t in geometry placement updater security server parallel; do python3 tests/test_$t.py; done
 ```
 
 To publish a release:

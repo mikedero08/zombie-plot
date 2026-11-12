@@ -24,7 +24,7 @@ def getj(path):
 
 def post(path, obj=None, raw=None):
     data = raw if raw is not None else json.dumps(obj or {}).encode()
-    req = urllib.request.Request(BASE + path, data=data, method="POST")
+    req = urllib.request.Request(BASE + path, data=data, method="POST", headers={"X-ZombiePlot": "1"})
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             return r.status, json.loads(r.read())
