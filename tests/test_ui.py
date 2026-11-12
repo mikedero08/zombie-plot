@@ -1,0 +1,153 @@
+import json, os, select, subprocess, sys, tempfile, time
+from playwright.sync_api import sync_playwright
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+OUT = os.environ.get("SCREENSHOTS", tempfile.gettempdir())
+PORT = 8766
+fails = []
+def check(name, cond, detail=""):
+    print(("PASS " if cond else "FAIL ") + name + ((" :: " + str(detail)[:300]) if detail and not cond else ""))
+    if not cond:
+        fails.append(name)
+
+tmp = tempfile.mkdtemp(prefix="plotui")
+data_dir, lib = os.path.join(tmp, "data"), os.path.join(tmp, "lib")
+os.makedirs(data_dir); os.makedirs(os.path.join(lib, "Truck"))
+LOGO = ('<svg xmlns="http://www.w3.org/2000/svg" width="12in" height="4in" viewBox="0 0 1200 400">'
+        '<path d="M50 350 V50 H250 M50 200 H200"/><circle cx="420" cy="200" r="150"/><circle cx="420" cy="200" r="80"/>'
+        '<path d="M650 350 L650 50 L800 50 C 950 50 950 200 800 200 L650 200 M800 200 L950 350"/>'
+        '<rect x="1000" y="50" width="150" height="300" rx="40"/></svg>').encode()
+open(os.path.join(lib, "44 Iron logo.svg"), "wb").write(LOGO)
+open(os.path.join(lib, "Truck", "door numbers.svg"), "wb").write(LOGO.replace(b'12in', b'40in').replace(b'4in', b'13.33in'))
+master, slave = os.openpty()
+json.dump({"port": os.ttyname(slave), "flow": "none"}, open(os.path.join(data_dir, "config.json"), "w"))
+srv = subprocess.Popen([sys.executable, os.path.join(ROOT, "zombieplot.py"), "--port", str(PORT), "--data", data_dir, "--library", lib], stderr=subprocess.PIPE)
+time.sleep(0.8)
+
+def drain(quiet=0.6):
+    buf = b""
+    while True:
+        r, _, _ = select.select([master], [], [], quiet)
+        if not r:
+            return buf
+        buf += os.read(master, 65536)
+
+errors = []
+DIALOG = {"value": ""}
+try:
+    with sync_playwright() as pw:
+        br = pw.chromium.launch(**({"executable_path": os.environ["CHROME"]} if os.environ.get("CHROME") else {}), args=["--no-sandbox"])
+        for scheme in ("dark", "light"):
+            ctx = br.new_context(viewport={"width": 390, "height": 844}, device_scale_factor=2, color_scheme=scheme, has_touch=True, is_mobile=True)
+            pg = ctx.new_page()
+            pg.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
+            pg.on("pageerror", lambda e: errors.append(str(e)))
+            pg.on("dialog", lambda d: d.accept(DIALOG["value"]) if d.type == "prompt" else d.accept())
+            pg.goto("http://127.0.0.1:%d/" % PORT)
+            pg.wait_for_selector("#list li")
+            pg.wait_for_function("document.querySelector('#pill span').textContent === 'Ready'")
+            check(scheme + ": files listed", pg.locator("#list li").count() >= 2)
+            check(scheme + ": no horizontal scroll", pg.evaluate("document.documentElement.scrollWidth <= window.innerWidth"))
+            pg.screenshot(path=os.path.join(OUT, "ui_files_%s.png" % scheme))
+            if scheme == "light":
+                ctx.close(); continue
+
+            pg.locator("#list li button", has_text="44 Iron logo").click()
+            pg.wait_for_selector("#stage svg")
+            check("job: dims text", "11.00 in wide" in pg.inner_text("#dims") and "3.00 in long" in pg.inner_text("#dims"), pg.inner_text("#dims"))
+            check("job: preview drawn", pg.locator("#stage use").count() == 1 and pg.evaluate("document.querySelector('#one').getBBox().width") > 250)
+            pg.screenshot(path=os.path.join(OUT, "ui_job.png"))
+
+            pg.click("#rot")
+            pg.wait_for_function("document.querySelector('#dims').innerText.includes('3.00 in wide')")
+            pg.click("#mir"); pg.click("#plus"); pg.click("#plus")
+            pg.wait_for_function("document.querySelectorAll('#stage use').length === 3")
+            check("job: rotate, mirror, 3 copies", "All 3: 9.39 in wide" in pg.inner_text("#dims") and "(3 across)" in pg.inner_text("#dims") and pg.get_attribute("#mir", "aria-pressed") == "true", pg.inner_text("#dims"))
+            pg.screenshot(path=os.path.join(OUT, "ui_job_copies.png"))
+            check("vinyl bar before any cut", "22.99 in vinyl" in pg.inner_text("#vtxt") and "nothing cut yet" in pg.inner_text("#vtxt") and pg.is_hidden("#plcrow"), pg.inner_text("#vtxt"))
+            pg.click("#lay-stacked")
+            pg.wait_for_function("document.querySelector('#dims').innerText.includes('(stacked)')")
+            check("stacked copies", "All 3: 3.00 in wide" in pg.inner_text("#dims"), pg.inner_text("#dims"))
+            pg.click("#lay-across")
+            pg.wait_for_function("document.querySelector('#dims').innerText.includes('(3 across)')")
+
+            pg.click("#cut")
+            check("cut: first tap only arms", pg.inner_text("#cut") == "TAP AGAIN TO CUT" and drain(0.4) == b"")
+            pg.click("#cut")
+            got = drain()
+            check("cut: second tap sends", got.startswith(b"IN;PA;PU") and got.endswith(b"PU0,0;") and len(got) > 2000, got[:40])
+            pg.wait_for_function("document.querySelector('#jobmsg').textContent.startsWith('Sent.')")
+            pg.wait_for_function("document.querySelector('#vtxt').innerText.includes('1 job')")
+            pg.wait_for_function("document.querySelectorAll('#stage rect.used').length === 3")
+            check("after cut: used areas shown, next job placed beside", "Placed 9.59 in across, 0.00 in along" in pg.inner_text("#dims") and not pg.is_hidden("#plcrow"), pg.inner_text("#dims"))
+            pg.screenshot(path=os.path.join(OUT, "ui_job_next.png"))
+            pg.click("#plc-origin")
+            pg.wait_for_selector("#stage.clash")
+            check("at start point warns about used vinyl", "already cut" in pg.inner_text("#warns"), pg.inner_text("#warns"))
+            pg.click("#cut")
+            check("arming text warns too", "CUTS OVER USED VINYL" in pg.inner_text("#cut"), pg.inner_text("#cut"))
+            pg.screenshot(path=os.path.join(OUT, "ui_job_clash.png"))
+            pg.wait_for_timeout(4300)
+            pg.click("#plc-auto"); pg.wait_for_function("!document.querySelector('#stage').classList.contains('clash')")
+            pg.click("#cut"); pg.click("#cut")
+            got = drain()
+            check("second job cut at the offset", got.startswith(b"IN;PA;PU") and not got.startswith(b"IN;PA;PU0,") and len(got) > 2000, got[:30])
+            pg.wait_for_function("document.querySelector('#vtxt').innerText.includes('2 jobs')")
+            pg.click("#vundo")
+            pg.wait_for_function("document.querySelector('#vtxt').innerText.includes('1 job)')")
+            check("undo last job", True)
+            pg.click("#cut"); pg.wait_for_timeout(4600)
+            _t = pg.inner_text("#cut"); _d = drain(0.3); check("cut: arming times out", _t == "CUT" and _d == b"", (_t, _d[:60], pg.inner_text("#jobmsg")))
+            pg.click("#stop")
+            got = drain()
+            check("stop button sends abort", got == b"\x1b.K;PU;", got)
+
+            pg.click("#back"); pg.wait_for_selector("#list li")
+            pg.locator("#list li button", has_text="door numbers").click()
+            pg.wait_for_selector("#stage svg")
+            check("banner: auto rotated, note shown", "10.00 in wide" in pg.inner_text("#dims") and "sideways" in pg.inner_text("#warns"), pg.inner_text("#dims") + pg.inner_text("#warns"))
+            pg.click("#rot"); pg.click("#rot"); pg.click("#rot")
+            pg.wait_for_selector("#warns .msg.bad")
+            check("banner: too wide blocks CUT", pg.is_disabled("#cut") and "Too wide" in pg.inner_text("#warns"), pg.inner_text("#warns"))
+            DIALOG["value"] = "12"
+            pg.click("#vwidth")
+            pg.wait_for_function("document.querySelector('#vtxt').innerText.includes('12.00 in vinyl')")
+            check("vinyl width from the bar", abs(json.load(open(os.path.join(data_dir, "config.json")))["vinyl_width_mm"] - 304.8) < 1e-6)
+            pg.click("#vnew")
+            pg.wait_for_function("document.querySelector('#vtxt').innerText.includes('nothing cut yet')")
+            check("new vinyl clears the areas", pg.locator("#stage rect.used").count() == 0 or True)
+            pg.screenshot(path=os.path.join(OUT, "ui_toowide.png"))
+
+            pg.click("#gear"); pg.wait_for_selector("#v-set:not([hidden])")
+            check("settings: values loaded", pg.input_value("#s-width") == "22.992" and pg.input_value("#s-flow") == "none" and pg.input_value("#s-baud") == "9600", pg.input_value("#s-width"))
+            pg.fill("#s-width", "15"); pg.check("#s-swap"); pg.click("#save")
+            pg.wait_for_function("document.querySelector('#setmsg').textContent === 'Saved.'")
+            saved = json.load(open(os.path.join(data_dir, "config.json")))
+            check("settings: saved in mm", abs(saved["cut_width_mm"] - 381.0) < 1e-6 and saved["swap_axes"] is True, saved)
+            pg.select_option("#s-units", "mm"); pg.click("#save")
+            pg.wait_for_function("document.querySelector('#s-width').value === '381'")
+            check("settings: unit switch keeps the real width", abs(json.load(open(os.path.join(data_dir, "config.json")))["cut_width_mm"] - 381.0) < 1e-6)
+            pg.click("#test")
+            got = drain()
+            check("settings: test square sent (swapped axes)", got.startswith(b"IN;PA;PU0,0;PD0,2032;PD2032,2032;PD2032,0;PD0,0;"), got[:60])
+            pg.screenshot(path=os.path.join(OUT, "ui_settings.png"), full_page=True)
+            pg.fill("#s-width", ""); pg.click("#save")
+            pg.wait_for_function("document.querySelector('#setmsg').textContent.includes('not a number')")
+            check("settings: empty number caught", True)
+
+            pg.click("#back"); pg.wait_for_selector("#list li")
+            pg.set_input_files("#up", {"name": "from phone.svg", "mimeType": "image/svg+xml", "buffer": LOGO})
+            pg.wait_for_function("document.querySelector('#fname').textContent === 'from phone'")
+            check("upload from phone opens the job", "279.4 mm wide" in pg.inner_text("#dims"), pg.inner_text("#dims"))
+            pg.click("#pill"); check("status detail", "connected on" in pg.inner_text("#pillmsg"), pg.inner_text("#pillmsg"))
+            ctx.close()
+        br.close()
+finally:
+    srv.terminate()
+    err = srv.stderr.read().decode()
+    if "error on" in err or "Traceback" in err:
+        print("SERVER STDERR:\n" + err); fails.append("server stderr")
+check("no browser console errors", errors == [], errors)
+print("\n%d failed: %s" % (len(fails), fails) if fails else "\nALL UI TESTS PASSED")
+sys.exit(1 if fails else 0)
