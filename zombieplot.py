@@ -2833,7 +2833,9 @@ THING = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>zombiePlot</title>
 <style>
-/* Sized for the Car Thing's 800 x 480 screen and its old Chromium: no flex gap, no newer syntax. */
+/* Sized for the Car Thing's 800 x 480 screen and its old Chromium: no flex gap, no newer syntax.
+   The dial overhangs the right edge of the screen: about the right 50 px, top 320 px. Nothing to
+   read or press goes there (measured from a photo of a real Car Thing). */
 :root{--bg:#15181b;--panel:#1e2327;--line:#30373d;--text:#e9edf0;--dim:#97a2ab;--go:#f2a33a;--go-text:#1a1305;
 --ok:#4fbf7b;--warn:#f2a33a;--bad:#ef5d52;--vinyl:#262c31}
 *{box-sizing:border-box}
@@ -2843,7 +2845,7 @@ font:20px/1.3 system-ui,"Segoe UI",sans-serif;-webkit-user-select:none;user-sele
 button{font:inherit;color:inherit;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:0}
 button:disabled{opacity:.4}
 [hidden]{display:none!important}
-#keys{height:42px;display:flex;align-items:stretch;border-bottom:1px solid var(--line)}
+#keys{height:42px;display:flex;align-items:stretch;border-bottom:1px solid var(--line);padding-right:64px}
 #keys .k{flex:1;display:flex;align-items:center;padding:0 8px;font-size:17px;color:var(--dim);white-space:nowrap;overflow:hidden}
 #keys .k i{font-style:normal;display:inline-block;min-width:22px;height:22px;line-height:20px;text-align:center;border:1px solid var(--line);
 border-radius:11px;font-size:13px;margin-right:6px;color:var(--dim)}
@@ -2853,7 +2855,7 @@ border-radius:11px;font-size:13px;margin-right:6px;color:var(--dim)}
 #keys .k.empty{visibility:hidden}
 #keys .k.m{flex:0 0 110px;justify-content:flex-end}
 #keys .k.m b{color:var(--bad)}
-#bar{height:36px;display:flex;align-items:center;padding:0 12px;font-size:17px;color:var(--dim)}
+#bar{height:36px;display:flex;align-items:center;padding:0 76px 0 12px;font-size:17px;color:var(--dim)}
 #pill{display:inline-flex;align-items:center;font-weight:650;color:var(--text);margin-right:14px}
 #pill:before{content:"";width:12px;height:12px;border-radius:6px;margin-right:7px;background:var(--dim)}
 #pill.ok:before{background:var(--ok)}#pill.warn:before{background:var(--warn)}#pill.bad:before{background:var(--bad)}
@@ -2862,7 +2864,7 @@ border-radius:11px;font-size:13px;margin-right:6px;color:var(--dim)}
 #prog{height:4px;background:var(--line)}#bar2{height:4px;width:0;background:var(--ok)}
 main{position:absolute;top:82px;left:0;right:0;bottom:0}
 section{position:absolute;top:0;left:0;right:0;bottom:0}
-#list{list-style:none;margin:0;padding:4px 10px 10px;height:100%;overflow-y:auto}
+#list{list-style:none;margin:0;padding:4px 74px 10px 10px;height:100%;overflow-y:auto}
 #list li{display:flex;align-items:center;height:62px;padding:0 14px;margin-bottom:6px;border-radius:10px;
 background:var(--panel);border:2px solid transparent}
 #list li.sel{border-color:var(--go)}
@@ -2879,6 +2881,7 @@ background:var(--panel);border:2px solid transparent}
 #stage .jobbox{fill:none;stroke:var(--go);stroke-width:1.5;stroke-dasharray:6 4;vector-effect:non-scaling-stroke}
 #stage.clash .jobbox{stroke:var(--bad)}
 #side{position:absolute;left:calc(50% + 22px);right:10px;top:4px;bottom:10px;display:flex;flex-direction:column}
+#fname,#dims,#cnt,#warns,#jobhint{margin-right:54px}
 #fname{font-size:22px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #dims{font-size:17px;color:var(--dim);margin-top:2px}
 #dims b{color:var(--text);font-weight:600}
@@ -2892,12 +2895,12 @@ background:var(--panel);border:2px solid transparent}
 #cut{height:76px;font-size:26px;font-weight:750;letter-spacing:.04em;background:var(--go);color:var(--go-text);border:0}
 #cut.armed{background:var(--bad);color:#fff}
 #stop{height:76px;font-size:26px;font-weight:750;background:var(--bad);color:#fff;border:0}
-#v-login{display:flex;align-items:center;justify-content:center}
+#v-login{display:flex;align-items:center;justify-content:center;padding-right:64px}
 #v-login .l{width:300px;margin-right:40px}
 #dots{font-size:44px;letter-spacing:.2em;min-height:60px;margin-top:10px}
 #pad{width:330px;display:flex;flex-wrap:wrap}
 #pad button{width:100px;height:72px;margin:0 10px 10px 0;font-size:28px}
-#toast{position:absolute;left:20px;right:20px;bottom:16px;padding:14px 18px;border-radius:10px;background:var(--panel);
+#toast{position:absolute;left:20px;right:84px;bottom:16px;padding:14px 18px;border-radius:10px;background:var(--panel);
 border-left:5px solid var(--bad);font-size:19px;box-shadow:0 6px 24px rgba(0,0,0,.5)}
 #toast.ok{border-left-color:var(--ok)}
 #sleep{position:absolute;left:0;top:0;right:0;bottom:0;background:#000;z-index:50}

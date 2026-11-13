@@ -200,6 +200,15 @@ try:
         dial(2)
         pc.wait_for_function("document.querySelectorAll('#stage use').length === 3")
         check("thing: dial sets copies", pc.inner_text("#cntn") == "3")
+        # The dial overhangs about the right 50 px of the top 320 px of the screen.
+        hidden = pc.evaluate("""() => {
+          const bad = [];
+          document.querySelectorAll('button, #fname, #dims, #cnt span, #keys .k b, #vtxt, #list .s').forEach(el => {
+            const r = el.getBoundingClientRect();
+            if (r.width && r.height && r.top < 320 && r.right > 746 && getComputedStyle(el).visibility !== 'hidden') bad.push((el.id || el.className || el.tagName) + ':' + Math.round(r.right));
+          });
+          return bad; }""")
+        check("thing: nothing to read or press under the dial", hidden == [], hidden)
         pc.keyboard.press("2")
         pc.wait_for_function("document.querySelector('#k2 b').textContent === 'Mirror on'")
         check("thing: button 2 mirrors", pc.evaluate("S.mirror") is True)
