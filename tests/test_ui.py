@@ -50,6 +50,9 @@ try:
             pg.wait_for_function("document.querySelector('#pill span').textContent === 'Ready \u00b7 SER'")
             check(scheme + ": files listed", pg.locator("#list li").count() >= 2)
             check(scheme + ": no horizontal scroll", pg.evaluate("document.documentElement.scrollWidth <= window.innerWidth"))
+            check(scheme + ": logo and walking zombie in the header", pg.is_visible("#brand .logo") and pg.is_visible("#brand .zombie"))
+            hdr = pg.evaluate("(() => { const h = document.querySelector('header'); return [h.scrollWidth, h.clientWidth]; })()")
+            check(scheme + ": header fits on one line", hdr[0] <= hdr[1], hdr)
             pg.screenshot(path=os.path.join(OUT, "ui_files_%s.png" % scheme))
             if scheme == "light":
                 ctx.close(); continue
@@ -187,6 +190,7 @@ try:
         pc.goto("http://127.0.0.1:%d/thing" % PORT)
         pc.wait_for_selector("#list li.sel")
         pc.wait_for_function("document.querySelector('#pill').textContent.startsWith('Ready')")
+        check("thing: logo and zombie on the status line", pc.is_visible("#bar .logo") and pc.is_visible("#bar .zombie"))
         check("thing: fits the screen with no scrolling page",
               pc.evaluate("document.documentElement.scrollWidth <= 800 && document.documentElement.scrollHeight <= 480"))
         pc.screenshot(path=os.path.join(OUT, "thing_files.png"))
