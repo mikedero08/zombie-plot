@@ -60,7 +60,8 @@ if [ "$MODE" = "--uninstall" ]; then
           /etc/NetworkManager/conf.d/$APP-wifi-powersave.conf /etc/NetworkManager/conf.d/plotter-wifi-powersave.conf
     rm -rf "$PROG" /opt/plotter
     drop_share_lines
-    rm -f "$CRED" /etc/plotter-share.cred
+    rm -f "$CRED" /etc/plotter-share.cred /etc/$APP-carthing.enabled
+    command -v nmcli >/dev/null && nmcli connection delete $APP-carthing >/dev/null 2>&1 || true
     echo "Removed. Settings and files sent from the phone are still in $DATA (delete that folder if you want them gone)."
     exit 0
 fi
@@ -292,26 +293,59 @@ systemctl restart $APP.service
 # ---------------------------------------------------------------- 7. car thing
 say "7/8  Car Thing remote (optional)"
 CT_UNIT=/etc/systemd/system/$APP-carthing.service
+CT_MARK=/etc/$APP-carthing.enabled
+CT_CON=$APP-carthing
 WANT_CT=0
 if [ "$MODE" = "--upgrade" ]; then
-    [ -f "$CT_UNIT" ] && WANT_CT=1
-elif [ -f "$CT_UNIT" ]; then
+    { [ -f "$CT_MARK" ] || [ -f "$CT_UNIT" ]; } && WANT_CT=1
+elif [ -f "$CT_MARK" ] || [ -f "$CT_UNIT" ]; then
     read -r -p "The Car Thing remote is set up. Keep it? [Y/n] " ans
     case "$ans" in [nN]*) ;; *) WANT_CT=1 ;; esac
 else
     echo "A Spotify Car Thing plugged into this box's USB port can work as a remote:"
-    echo "pick files with its dial, cut, stop. It must be flashed with adb turned on first (see README)."
+    echo "pick files with its dial, cut, stop. It must be flashed with the Thing Labs image first (see README)."
     read -r -p "Set up the Car Thing remote? [y/N] " ans
     case "$ans" in [yY]*) WANT_CT=1 ;; esac
 fi
-if [ "$WANT_CT" = 1 ]; then
-    if ! command -v adb >/dev/null; then
-        echo "Installing adb..."
-        { apt-get update >/dev/null && apt-get install -y adb >/dev/null; } \
-            || apt-get install -y android-tools-adb >/dev/null \
-            || fail "Could not install adb. Check this box has internet access, then run the installer again."
+drop_ct_adb() {
+    if [ -f "$CT_UNIT" ]; then
+        systemctl disable --now $APP-carthing.service >/dev/null 2>&1 || true
+        rm -f "$CT_UNIT"
+        systemctl daemon-reload
     fi
-    cat > "$CT_UNIT" <<EOF
+}
+if [ "$WANT_CT" = 1 ]; then
+    touch "$CT_MARK"
+    # The USB network link: the Car Thing is 192.168.7.2, this box 192.168.7.1. Matched by the
+    # link's fixed address, so it works whatever name the interface gets.
+    if command -v nmcli >/dev/null; then
+        nmcli connection delete "$CT_CON" >/dev/null 2>&1 || true
+        if nmcli connection add type ethernet con-name "$CT_CON" 802-3-ethernet.mac-address a0:b1:c2:d3:e4:01 \
+                ipv4.method manual ipv4.addresses 192.168.7.1/24 ipv4.never-default yes \
+                ipv6.method disabled connection.autoconnect yes >/dev/null; then
+            nmcli connection up "$CT_CON" >/dev/null 2>&1 || true     # fails harmlessly while unplugged
+            echo "USB link set up: this box is 192.168.7.1 on the Car Thing's cable."
+        else
+            echo "WARNING: could not set up the Car Thing's USB link with NetworkManager."
+        fi
+    else
+        echo "WARNING: NetworkManager not found. Give the Car Thing's USB network interface 192.168.7.1/24 by hand."
+    fi
+    # adb puts the start page on the Car Thing by itself, on Pis whose processor can run it.
+    CAN_ADB=0
+    case "$(uname -m)" in
+        armv6l) ;;
+        *)
+            if ! command -v adb >/dev/null; then
+                echo "Installing adb..."
+                { apt-get update >/dev/null && apt-get install -y adb >/dev/null; } \
+                    || apt-get install -y android-tools-adb >/dev/null || true
+            fi
+            command -v adb >/dev/null && adb version >/dev/null 2>&1 && CAN_ADB=1
+            ;;
+    esac
+    if [ "$CAN_ADB" = 1 ]; then
+        cat > "$CT_UNIT" <<UNIT
 [Unit]
 Description=zombiePlot Car Thing remote (USB)
 After=$APP.service
@@ -330,17 +364,23 @@ NoNewPrivileges=yes
 
 [Install]
 WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable $APP-carthing.service >/dev/null 2>&1
-    systemctl restart $APP-carthing.service
-    echo "Car Thing remote is on. Plug the Car Thing into this box; its screen switches to zombiePlot."
-    echo "Messages: sudo journalctl -u $APP-carthing -n 30"
-else
-    if [ -f "$CT_UNIT" ]; then
-        systemctl disable --now $APP-carthing.service >/dev/null 2>&1 || true
-        rm -f "$CT_UNIT"
+UNIT
         systemctl daemon-reload
+        systemctl enable $APP-carthing.service >/dev/null 2>&1
+        systemctl restart $APP-carthing.service
+        echo "Car Thing remote is on. Plug the Car Thing into this box; its screen switches to zombiePlot."
+        echo "Messages: sudo journalctl -u $APP-carthing -n 30"
+    else
+        drop_ct_adb
+        echo "Car Thing remote is on. This Pi's processor can't run adb (original Model B+ or Zero),"
+        echo "so put the zombiePlot start page on the Car Thing once from a computer: see the README,"
+        echo "\"Car Thing remote\", Step 2. After that, just plug the Car Thing into this box."
+    fi
+else
+    drop_ct_adb
+    if [ -f "$CT_MARK" ] || nmcli -t -f NAME connection show 2>/dev/null | grep -qx "$CT_CON"; then
+        nmcli connection delete "$CT_CON" >/dev/null 2>&1 || true
+        rm -f "$CT_MARK"
         echo "Car Thing remote removed."
     else
         echo "Skipped."

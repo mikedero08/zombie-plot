@@ -2,12 +2,6 @@
 import json, os, subprocess, sys, tempfile, textwrap
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-if sys.platform == "win32":                 # zombieplot imports these for the cable code only
-    import types
-    for _m in ("fcntl", "termios"):
-        _mod = types.ModuleType(_m)
-        _mod.__getattr__ = lambda attr: 0
-        sys.modules.setdefault(_m, _mod)
 import zombieplot as P
 
 fails = []
@@ -73,7 +67,7 @@ def shells(st):
     return [c[1] for c in st["calls"] if c[0] == "shell"]
 
 page = P.car_thing_launcher()
-check("launcher opens /thing on the forwarded port", "http://localhost:%d" % P.CAR_THING_PORT in page and "/thing" in page)
+check("launcher tries the USB link first, then the adb route", page.index("http://%s" % P.CAR_THING_LINK_HOST) < page.index("http://localhost:%d" % P.CAR_THING_PORT) and "/thing" in page)
 check("launcher waits for the box before leaving", "setTimeout(tryit" in page and "location.replace" in page)
 
 reset()
@@ -114,10 +108,22 @@ except P.CarThingError as e:
     check("adb failure reported", "no devices" in str(e), e)
 del os.environ["FAKE_ADB_FAIL"]
 
+check("adb that cannot run is detected", not P.adb_works(os.path.join(tmp, "no-such-adb")))
+try:
+    P.car_thing_once(os.path.join(tmp, "no-such-adb"))
+    check("--car-thing-install refuses an adb that cannot run", False)
+except SystemExit as e:
+    check("--car-thing-install refuses an adb that cannot run", "does not run" in str(e), e)
+
+reset()
+P.car_thing_once(ADB)
+st = state()
+check("--car-thing-install puts the launcher on, without any adb reverse", st["files"].get(idx) == page and not st["reverse"], st["calls"])
+
 r = subprocess.run([sys.executable, os.path.join(ROOT, "zombieplot.py"), "--help"], stdout=subprocess.PIPE,
-                   stderr=subprocess.STDOUT, universal_newlines=True) if sys.platform != "win32" else None
-if r is not None:
-    check("--car-thing listed in --help", "--car-thing" in r.stdout and "--car-thing-restore" in r.stdout, r.stdout[-400:])
+                   stderr=subprocess.STDOUT, universal_newlines=True)
+if True:
+    check("--car-thing options listed in --help", all(o in r.stdout for o in ("--car-thing-install", "--car-thing-restore", "--adb")), r.stdout[-400:])
 
 print("\n%d failed: %s" % (len(fails), fails) if fails else "\nALL CAR THING TESTS PASSED")
 sys.exit(1 if fails else 0)

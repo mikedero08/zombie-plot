@@ -13,7 +13,6 @@ Run:  python3 zombieplot.py --port 80 --data /var/lib/zombieplot --library /mnt/
 
 import argparse
 import errno
-import fcntl
 import glob
 import hashlib
 import hmac
@@ -30,14 +29,18 @@ import struct
 import subprocess
 import sys
 import tempfile
-import termios
 import threading
 import time
 import xml.etree.ElementTree as ET
+try:
+    import fcntl
+    import termios
+except ImportError:       # Windows: only --car-thing-install is meant to run there
+    fcntl = termios = None
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 UNITS_PER_MM = 40.0          # CAMM-GL III step = 0.025 mm
 FLATTEN_TOL_MM = 0.03        # curve-to-line tolerance (about one cutter step)
 MAX_UPLOAD = 25 * 1024 * 1024
@@ -851,7 +854,7 @@ class Cancelled(Exception):
     pass
 
 
-BAUDS = {2400: termios.B2400, 4800: termios.B4800, 9600: termios.B9600, 19200: termios.B19200}
+BAUDS = {2400: termios.B2400, 4800: termios.B4800, 9600: termios.B9600, 19200: termios.B19200} if termios else {}
 CHUNK = 128
 NO_ADAPTER = "No plotter cable found. Check that the plotter's USB cable is plugged into this box."
 LPGETSTATUS = 0x060b
@@ -2627,16 +2630,25 @@ $("up").onchange = async ev => {
 # ----------------------------------------------------------------------------
 # Car Thing remote (Spotify Car Thing plugged into this box's USB port)
 # ----------------------------------------------------------------------------
-# The Car Thing's screen is a Chromium web view that loads a page from its own flash. With adb
-# turned on (flashed once from a PC), --car-thing puts a small launcher page there and runs
-# "adb reverse", so the Car Thing reaches this box's web server at http://localhost:8742 over USB.
-# The launcher opens /thing, which is served from here like the phone page, so it gets the same
-# protections (Host check, X-ZombiePlot header, PIN). The Car Thing never needs Wi-Fi.
+# The Car Thing's screen is a Chromium web view that loads a page from its own flash. Flashed with
+# the Thing Labs image, it also has adb and a USB network link (RNDIS): the Car Thing is
+# 192.168.7.2 and this box takes 192.168.7.1 on that cable (install.sh sets that up). A small
+# launcher page, put on the Car Thing once with adb, opens /thing from this box over that link, so
+# it gets the same protections as the phone page (Host check, X-ZombiePlot header, PIN) and the Car
+# Thing never needs Wi-Fi.
+#
+# Putting the launcher on: --car-thing-install, from any computer that can run adb (Windows too).
+# On a Pi that can run adb (Pi 2 and newer), --car-thing also does it on its own, and adds an
+# "adb reverse" route to http://localhost:8742 as a second way in. The original Model B+ and Zero
+# have an ARMv6 processor that the packaged adb doesn't run on, so they use the USB link only.
 #
 # Car Thing input as the web view sees it: dial turn = wheel event, dial press = Enter,
 # back button = Escape, the four top buttons = 1 to 4, the top-right button = m.
 
-CAR_THING_PORT = 8742
+CAR_THING_PORT = 8742                      # adb reverse route on the Car Thing
+CAR_THING_LINK_HOST = "192.168.7.1"        # this box on the USB network link
+CAR_THING_LINK_IP = "192.168.7.2"          # the Car Thing on that link (Thing Labs image)
+CAR_THING_MAC = "a0:b1:c2:d3:e4:01"        # the link's address as this box sees it
 CAR_THING_WEBAPP = "/usr/share/qt-superbird-app/webapp"
 CAR_THING_BACKUP = CAR_THING_WEBAPP + ".before-zombieplot"
 
@@ -2646,14 +2658,19 @@ class CarThingError(Exception):
 
 
 def car_thing_launcher():
-    """The page put on the Car Thing's flash. Waits until this box answers, then opens /thing."""
+    """The page put on the Car Thing's flash. Tries each way of reaching this box until one
+    answers, then opens /thing there."""
+    bases = ["http://%s" % CAR_THING_LINK_HOST, "http://%s:8080" % CAR_THING_LINK_HOST,
+             "http://localhost:%d" % CAR_THING_PORT]
     return ("<!doctype html><html><head><meta charset=\"utf-8\"><title>zombiePlot</title></head>"
             "<body style=\"margin:0;background:#15181b;color:#97a2ab;font:28px sans-serif;display:flex;"
             "align-items:center;justify-content:center;height:100vh\"><div>Waiting for zombiePlot...</div>"
-            "<script>var base='http://localhost:%d';function go(){location.replace(base+'/thing');}"
-            "function tryit(){if(!window.fetch){setTimeout(go,3000);return;}"
-            "fetch(base+'/api/status',{mode:'no-cors',cache:'no-store'}).then(go,function(){setTimeout(tryit,2000);});}"
-            "tryit();</script></body></html>" % CAR_THING_PORT)
+            "<script>var bases=%s,n=0;"
+            "function tryit(){var b=bases[n++%%bases.length];"
+            "if(!window.fetch){setTimeout(function(){location.replace(bases[0]+'/thing');},3000);return;}"
+            "fetch(b+'/api/status',{mode:'no-cors',cache:'no-store'})"
+            ".then(function(){location.replace(b+'/thing');},function(){setTimeout(tryit,1000);});}"
+            "tryit();</script></body></html>" % json.dumps(bases))
 
 
 def _adb(adb, *args, timeout=60):
@@ -2662,7 +2679,13 @@ def _adb(adb, *args, timeout=60):
                            universal_newlines=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         raise CarThingError("adb %s timed out" % args[0])
-    return r.returncode, (r.stdout or "").strip()
+    except OSError as e:
+        raise CarThingError("cannot run adb: %s" % e)
+    out = (r.stdout or "").strip()
+    if r.returncode < 0:
+        out = ("adb crashed (signal %d). This computer's processor may not run this adb build; "
+               "the original Pi Model B+ and Zero can't." % -r.returncode + (" " + out if out else ""))
+    return r.returncode, out
 
 
 def _adb_ok(adb, *args, timeout=60):
@@ -2670,6 +2693,13 @@ def _adb_ok(adb, *args, timeout=60):
     if code:
         raise CarThingError("adb %s failed: %s" % (" ".join(args)[:80], _tail(out, 300)))
     return out
+
+
+def adb_works(adb):
+    try:
+        return _adb(adb, "version", timeout=20)[0] == 0
+    except CarThingError:
+        return False
 
 
 def car_thing_reverse(adb, http_port):
@@ -2688,13 +2718,14 @@ def car_thing_install_page(adb):
                           "&& rm -rf %s && mkdir -p %s && echo ok" % (b, w, w, b, w, w))
     fd, tmp = tempfile.mkstemp(suffix=".html")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
             f.write(page)
         _adb_ok(adb, "push", tmp, w + "/index.html")
     finally:
         os.remove(tmp)
-    _adb(adb, "shell", "echo %s > %s/.zombieplot; sync; mount -o remount,ro / 2>/dev/null; "
-                       "supervisorctl restart chromium >/dev/null 2>&1 || reboot" % (mark, w))
+    _adb(adb, "shell", "echo %s > %s/.zombieplot; chmod 755 %s; chmod 644 %s/index.html %s/.zombieplot; sync; "
+                       "mount -o remount,ro / 2>/dev/null; supervisorctl restart chromium >/dev/null 2>&1 || reboot"
+                       % (mark, w, w, w, w))
     return True
 
 
@@ -2708,25 +2739,44 @@ def car_thing_restore(adb):
     _adb(adb, "shell", "mount -o remount,ro / 2>/dev/null; supervisorctl restart chromium >/dev/null 2>&1 || reboot")
 
 
-def run_car_thing(http_port, restore=False):
-    """Runs as root next to the web page (zombieplot-carthing.service). Handles plug and unplug."""
+def car_thing_once(adb, restore=False):
+    """--car-thing-install / --car-thing-restore: wait for the Car Thing, do it, finish."""
+    adb = adb or shutil.which("adb")
+    if not adb:
+        raise SystemExit("adb was not found. Install Android platform-tools, or give its path with --adb.")
+    if not adb_works(adb):
+        raise SystemExit("adb does not run on this computer (%s). Use another computer for this step." % adb)
+    print("Waiting for the Car Thing (plug it into this computer's USB port)...")
+    sys.stdout.flush()
+    code, out = _adb(adb, "wait-for-usb-device", timeout=None)
+    if code:
+        raise SystemExit("adb: " + _tail(out, 300))
+    try:
+        if restore:
+            car_thing_restore(adb)
+            print("Done. The Car Thing shows its earlier screen again.")
+        elif car_thing_install_page(adb):
+            print("Done. The Car Thing's screen now opens zombiePlot. Plug it into the zombiePlot box.")
+        else:
+            print("The Car Thing already has the zombiePlot start page. Plug it into the zombiePlot box.")
+    except CarThingError as e:
+        raise SystemExit(str(e))
+
+
+def run_car_thing(http_port):
+    """--car-thing: runs as root next to the web page on a Pi that can run adb
+    (zombieplot-carthing.service). Keeps the launcher installed and the adb route up."""
     adb = shutil.which("adb")
     if not adb:
         raise SystemExit("adb is not installed. Run: sudo apt-get install -y adb")
+    if not adb_works(adb):
+        raise SystemExit("adb does not run on this Pi's processor. The Car Thing still works over the "
+                         "USB network link; put its start page on once from a computer (see README).")
 
     def log(msg):
         sys.stderr.write(msg + "\n")
         sys.stderr.flush()
 
-    if restore:
-        log("Waiting for the Car Thing to be plugged in...")
-        _adb(adb, "wait-for-usb-device", timeout=None)
-        try:
-            car_thing_restore(adb)
-        except CarThingError as e:
-            raise SystemExit(str(e))
-        log("Done. The Car Thing shows its earlier screen again.")
-        return
     log("zombiePlot %s: Car Thing remote, forwarding its port %d to web port %d"
         % (VERSION, CAR_THING_PORT, http_port))
     while True:
@@ -3197,11 +3247,17 @@ def main():
     ap.add_argument("--clear-pin", action="store_true", help="remove the access PIN (run as the zombieplot user)")
     ap.add_argument("--car-thing", action="store_true",
                     help="run the Car Thing remote: forwards a USB-connected Car Thing to the web page (run as root)")
+    ap.add_argument("--car-thing-install", action="store_true",
+                    help="put the zombiePlot start page on a Car Thing plugged into this computer (needs adb)")
     ap.add_argument("--car-thing-restore", action="store_true",
-                    help="put back the Car Thing's earlier screen (run as root, Car Thing plugged in)")
+                    help="put back the Car Thing's earlier screen (needs adb, Car Thing plugged in)")
+    ap.add_argument("--adb", default="", help="path to adb, for --car-thing-install / --car-thing-restore")
     args = ap.parse_args()
-    if args.car_thing or args.car_thing_restore:
-        run_car_thing(args.port, restore=args.car_thing_restore)
+    if args.car_thing_install or args.car_thing_restore:
+        car_thing_once(args.adb, restore=args.car_thing_restore)
+        return
+    if args.car_thing:
+        run_car_thing(args.port)
         return
     if args.clear_pin:
         Config(os.path.join(args.data, "config.json")).update({"pin_hash": ""})

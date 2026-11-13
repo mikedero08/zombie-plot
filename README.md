@@ -243,20 +243,34 @@ The top of the screen always shows what the four buttons do right now. Everythin
 ### What you need
 
 - A Car Thing and a USB-C cable that carries data (not a charge-only cable).
-- A Windows, Mac or Linux computer for flashing the Car Thing once.
-- Enough USB power. The original Model B+ shares about 0.6 A across its USB ports. With the Car Thing, the plotter cable and a Wi-Fi adapter all plugged in, use a 2.5 A power supply and add `max_usb_current=1` to `/boot/firmware/config.txt` (`/boot/config.txt` on older systems), or plug the Car Thing into a powered USB hub.
+- A Windows, Mac or Linux computer with Chrome or Edge, for flashing the Car Thing once.
+- Enough USB power. The original Model B+ shares about 0.6 A across its USB ports. With the Car Thing, the plotter cable and a Wi-Fi adapter all plugged in, use a 2.5 A power supply and add `max_usb_current=1` to `/boot/firmware/config.txt` (`/boot/config.txt` on older systems), or plug the Car Thing into a powered USB hub. Plug the Car Thing in after the Pi has started.
 
-### Step 1: Flash the Car Thing with adb turned on (once, on your computer)
+### Step 1: Flash the Car Thing with the Thing Labs image (once, on your computer)
 
-The Car Thing's own software has adb (the USB debugging connection zombiePlot uses) switched off. A community tool turns it on:
+The Thing Labs image is the Car Thing's own software with adb (USB debugging) and a USB network link turned on. zombiePlot uses both. Flashing wipes the Spotify software; the original is on thingify.tools if you ever want it back.
 
-1. Get **superbird-tool** (https://github.com/bishopdynamics/superbird-tool), or the flasher built into **DeskThing** (https://github.com/ItsRiprod/DeskThing), and an adb-enabled Car Thing image that tool recommends. Follow that tool's own instructions for your computer.
-2. Put the Car Thing in USB burn mode: hold **buttons 1 and 4** while plugging it into the computer. The screen stays dark.
-3. **Windows only:** run **Zadig**, choose the device named **GX-CHIP**, and install the **WinUSB** driver.
-4. **Back up the Car Thing first** with the tool's dump option, so you can always put the original software back.
-5. Flash the adb-enabled image and let the Car Thing restart.
+1. Download **8.9.2-thinglabs.zip** from https://thingify.tools/firmware/P3QZbZIDWnp5m_azQFQqP (Versions tab) and unzip it into a folder.
+2. Put the Car Thing in USB burn mode: unplug it, hold **buttons 1 and 4**, and plug it into the computer while still holding them. The screen stays black.
+3. **Windows only:** install the USB driver. In PowerShell: `irm https://driver.terbium.app/get | iex` (it installs the standard WinUSB driver; Windows asks for permission). Or use Zadig: device **GX-CHIP**, driver **WinUSB**.
+4. Open **https://terbium.app** in Chrome or Edge. Click **Begin**, connect **GX-CHIP**, then **unknown device from Amlogic**, choose **Restore Local Folder**, pick the unzipped folder, and start.
+5. When it's done, unplug and replug the Car Thing. The Spotify screen comes up; that's expected.
 
-### Step 2: Turn on the remote on the Pi
+### Step 2: Put the zombiePlot start page on the Car Thing
+
+**Pi 2 and newer:** skip this step. The Pi does it by itself in Step 4.
+
+**Original Model B+ and Zero:** their processor can't run adb, so do this once from your computer, with the Car Thing plugged into the computer:
+
+1. Download Android **platform-tools** for your computer from https://developer.android.com/tools/releases/platform-tools and unzip it.
+2. Download `zombieplot.py` from this repository, and install Python 3 if the computer doesn't have it.
+3. Run, using the path to the `adb` inside platform-tools (`adb.exe` on Windows):
+   ```
+   python zombieplot.py --car-thing-install --adb path/to/platform-tools/adb
+   ```
+   It waits for the Car Thing, saves its current screen, puts the start page on and restarts the screen, which then says "Waiting for zombiePlot...".
+
+### Step 3: Turn on the remote on the Pi
 
 Log in to the Pi (Step 3 above) and run the installer again:
 
@@ -264,31 +278,29 @@ Log in to the Pi (Step 3 above) and run the installer again:
 sudo bash /opt/zombieplot/install.sh
 ```
 
-Answer **y** to "Set up the Car Thing remote?". It installs adb and a small service, `zombieplot-carthing`, that waits for the Car Thing.
+Answer **y** to "Set up the Car Thing remote?". It sets up the USB network link to the Car Thing (the Pi is 192.168.7.1 on that cable, the Car Thing 192.168.7.2). On a Pi 2 or newer it also installs adb and a small service, `zombieplot-carthing`, that puts the start page on by itself.
 
-### Step 3: Plug it in
+### Step 4: Plug it in
 
-Plug the Car Thing into the Pi. The first time, the Pi puts a small start page on the Car Thing and restarts its screen (the original screen is saved on the Car Thing). After a few seconds the file list appears. From then on it opens zombiePlot every time it's plugged in or the Pi restarts.
+Plug the Car Thing into the Pi. After a few seconds "Waiting for zombiePlot..." changes to the file list. From then on it opens zombiePlot every time it's plugged in or the Pi restarts.
 
 If you set an access PIN, the Car Thing asks for it once on a number pad. Only digits can be typed there, so use a PIN made of numbers if you want to use the Car Thing.
 
 ### Taking it off again
 
-To stop using the Car Thing with zombiePlot and put its original screen back, plug it into the Pi and run:
+To put the Car Thing's earlier screen back, plug it into a computer that can run adb (a Pi 2 or newer, or the computer from Step 2) and run:
 
 ```
-sudo systemctl disable --now zombieplot-carthing
-```
-```
-sudo python3 /opt/zombieplot/zombieplot.py --car-thing-restore
+python zombieplot.py --car-thing-restore --adb path/to/platform-tools/adb
 ```
 
-Then run the installer again and answer **n** to the Car Thing question, so it removes the service.
+On a Pi 2 or newer, stop the service first: `sudo systemctl disable --now zombieplot-carthing`, then `sudo python3 /opt/zombieplot/zombieplot.py --car-thing-restore`. Then run the Pi's installer again and answer **n** to the Car Thing question.
 
 ### If it doesn't work
 
-- **The Car Thing says "Waiting for zombiePlot..."** The Pi isn't reaching it. Check the cable carries data, then see the service's messages: `sudo journalctl -u zombieplot-carthing -n 30`.
-- **"no devices" in those messages:** adb can't see the Car Thing. Run `sudo adb devices`. If the list is empty, the Car Thing wasn't flashed with adb on (Step 1), or the cable is charge-only.
+- **The Car Thing stays on "Waiting for zombiePlot...":** the Pi isn't answering on the USB link. On the Pi, `ping -c 3 192.168.7.2` should get replies. If it doesn't, check the cable carries data and run the installer again. `nmcli connection show` should list `zombieplot-carthing`.
+- **The Car Thing still shows the Spotify screen:** the start page isn't on it. Do Step 2 (B+ and Zero), or on a Pi 2 or newer see `sudo journalctl -u zombieplot-carthing -n 30`.
+- **"Illegal instruction" from adb on the Pi:** the Pi has an ARMv6 processor (original B+ or Zero). Use Step 2 instead; everything else works.
 - **The Pi restarts or the plotter cable drops out when the Car Thing is plugged in:** not enough USB power. See "What you need".
 - **The dial turns the wrong way:** tell us in an issue. Car Thing software versions differ.
 
@@ -380,7 +392,7 @@ zombiePlot is built for a home or shop network. See [SECURITY.md](SECURITY.md) f
   - Other cutter models.
   - Serial cables on real hardware.
   - Whether the Stop command (`ESC .K`) works over a parallel cable on every model.
-  - The Car Thing remote on a real Car Thing. Its page has been tested in a browser at the Car Thing's 800 × 480 size with its dial and buttons simulated, and the USB side against a simulated adb.
+  - The Car Thing remote's screen on a real Car Thing. Flashing with the Thing Labs image and the USB network link have been tested on a real Car Thing and Pi Model B+; the page has been tested in a browser at 800 × 480 with the dial and buttons simulated.
 
 ---
 
