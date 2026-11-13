@@ -1,1 +1,1 @@
-{"version": "1.4.1", "ref": "9cfe97e79818e52f4c6e207cacf7721798293805", "notes": "Fixes running the installer again from /opt/zombieplot."}
+{"version": "1.4.2", "ref": "4eaa60fcaf541c734a5f087b810d6949b375311d", "notes": "Car Thing remote works on the original Pi Model B+, over its USB network link."}
