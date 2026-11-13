@@ -44,7 +44,7 @@ sq = [([(0.0, 0.0), (10.0, 0.0)], False)]
 cfg = dict(P.DEFAULTS); cfg["overcut_mm"] = 0
 hp = P.build_hpgl(sq, [(0, 0)], 10, 5, cfg, base=(100, 50)).decode()
 check("base offset", hp == "IN;PA;PU4000,2000;PD4400,2000;PU0,0;", hp)
-c2 = dict(cfg, orientation="custom"); c2["swap_axes"] = True
+c2 = dict(cfg); c2["swap_axes"] = True
 hp = P.build_hpgl(sq, [(0, 0)], 10, 5, c2, base=(100, 50)).decode()
 check("base offset with swapped axes", hp == "IN;PA;PU2000,4000;PD2000,4400;PU0,0;", hp)
 hp = P.build_hpgl(sq, [(0, 0)], 10, 5, cfg, base=(100, 50), park=(0, 60)).decode()
@@ -105,18 +105,26 @@ app2.session.undo()
 check("undo removes the whole last job", app2.session.rects() == [(0, 0, 10, 10)])
 open(os.path.join(tmp, "data", "session.json"), "w").write("garbage")
 check("corrupt session file ignored", P.App(os.path.join(tmp, "data"), lib).session.rects() == [])
-# settings from before 1.8 are read as the matching layout
-for flags, want in (({}, "left"), ({"swap_axes": True, "mirror_carriage": True}, "right"), ({"swap_axes": True}, "custom")):
-    pth = os.path.join(tmp, "old.json"); json.dump(flags, open(pth, "w"))
-    check("old settings %s read as %s" % (flags, want), P.Config(pth).get("orientation") == want, P.Config(pth).get("orientation"))
-json.dump({"orientation": "left", "swap_axes": True}, open(pth, "w"))
-check("saved layout wins over old switches", P.Config(pth).get("orientation") == "left")
-# preview tells the page which side the start point is on
-app.cfg.update({"orientation": "right", "vinyl_width_mm": 300, "start_corner": "origin"})
+# the 1.8 front left / front right choice is turned back into the switches
+pth = os.path.join(tmp, "old.json")
+for stored, want in (({"orientation": "right", "swap_axes": True}, (True, True, False)), ({"orientation": "left", "swap_axes": True}, (False, False, False)),
+                     ({"orientation": "custom", "swap_axes": True}, (True, False, False)), ({"swap_axes": True, "mirror_feed": True}, (True, False, True))):
+    json.dump(stored, open(pth, "w"))
+    got = P.machine_flags(P.Config(pth).snapshot())
+    check("1.8 setting %s read as switches %s" % (stored, want), got == want, got)
+# preview tells the page which corner the start point is in
+app.cfg.update({"swap_axes": True, "mirror_carriage": True, "mirror_feed": False, "vinyl_width_mm": 300, "start_corner": "origin"})
 app.session.clear()
 pv = app.preview({"id": "lib:a.svg", "copies": 2})
-check("preview: start point on the right", pv["origin_side"] == "right" and len(pv["rects"]) == 2, (pv["origin_side"], pv["rects"]))
-app.cfg.update({"orientation": "left"})
+check("preview: start point front right", (pv["origin_side"], pv["origin_row"]) == ("right", "front") and len(pv["rects"]) == 2, (pv["origin_side"], pv["rects"]))
+app.cfg.update({"swap_axes": False, "mirror_carriage": False})
+# the setup test cut ignores the switches and the sheet memory, and is not remembered
+app.cfg.update({"swap_axes": True, "mirror_carriage": True}); app.session.add([(0, 0, 100, 100)], "x")
+ps = app.plan({"id": "test", "setup": True})
+check("setup test: switches off, at the start point", ps["setup"] and P.machine_flags(ps["cfg"]) == (False, False, False) and ps["base"] == (0.0, 0.0) and not ps["clash"], ps["base"])
+pn = app.plan({"id": "lib:a.svg", "setup": True})
+check("setup flag only works for the test logo", not pn["setup"])
+app.cfg.update({"swap_axes": False, "mirror_carriage": False}); app.session.clear()
 check("status reports the start point side", app.status()["vinyl"]["origin_side"] == "left")
 print("\n%d failed: %s" % (len(fails), fails) if fails else "\nALL PLACEMENT TESTS PASSED")
 sys.exit(1 if fails else 0)

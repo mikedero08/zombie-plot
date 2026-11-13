@@ -166,7 +166,7 @@ check("grid fewer copies than columns", (cols, rows) == (2, 1) and near(jw, 205)
 # 13. machine orientation flags
 sq = [([(0.0, 0.0), (10.0, 0.0), (10.0, 5.0)], False)]
 def hp(**kw):
-    c = dict(CFG, orientation="custom"); c.update(kw)
+    c = dict(CFG); c.update(kw)
     return P.build_hpgl(sq, [(0, 0)], 10, 5, c).decode()
 check("plain", hp() == "IN;PA;PU0,0;PD400,0;PD400,200;PU0,0;", hp())
 check("swap axes", hp(swap_axes=True) == "IN;PA;PU0,0;PD0,400;PD200,400;PU0,0;", hp(swap_axes=True))
@@ -175,15 +175,23 @@ check("mirror feed", hp(mirror_feed=True) == "IN;PA;PU0,200;PD400,200;PD400,0;PU
 check("advance", hp(end_action="advance").endswith("PU0,1200;"), hp(end_action="advance"))
 check("advance swapped", hp(end_action="advance", swap_axes=True).endswith("PU1200,0;"))
 # Start point front right (Roland ROTATE 90): swap + mirror across, which is a 90 degree turn, not a mirror.
-hr = P.build_hpgl(sq, [(0, 0)], 10, 5, dict(CFG, orientation="right")).decode()
-check("front right = swap + mirror across", hr == hp(swap_axes=True, mirror_carriage=True), (hr, hp(swap_axes=True, mirror_carriage=True)))
-check("front left = no change", P.build_hpgl(sq, [(0, 0)], 10, 5, dict(CFG, orientation="left", swap_axes=True)).decode() == hp(), "flags ignored unless custom")
+# Plotter setup: every one of the 8 possible test-cut pictures has a fix that undoes it exactly,
+# and the start point corner follows from the fix.
+L8 = P.setup_layouts()
+check("8 different pictures", len({l["a"] for l in L8}) == 8 and len({l["fix"] for l in L8}) == 8)
+ok = True
+for l in L8:
+    f = P.flags_matrix(*l["fix"]); a = l["a"]
+    prod = tuple(tuple(sum(a[i][k] * f[k][j] for k in range(2)) for j in range(2)) for i in range(2))
+    cfgx = dict(CFG, swap_axes=l["fix"][0], mirror_carriage=l["fix"][1], mirror_feed=l["fix"][2])
+    ok = ok and prod == ((1, 0), (0, 1)) and (P.origin_side(cfgx), P.origin_row(cfgx)) == l["corner"]
+check("each picture's fix turns the cut back to normal, start corner consistent", ok)
 # handedness: a front-right layout must not mirror. Map drawing (x right, y back) through the flags and the
 # physical axes of a ROTATE 90 plotter (HPGL X toward the back, Y toward the left) and check the turn is proper.
 import itertools
 pts = [(0.0, 0.0), (10.0, 0.0), (0.0, 5.0)]
 def phys(u, v): return (-v, u)          # HPGL (X back, Y left) -> front view (right, back)
-dev = [tuple(int(t) for t in seg.split(",")) for seg in P.build_hpgl([(pts, False)], [(0, 0)], 10, 5, dict(CFG, orientation="right", overcut_mm=0)).decode().replace("IN;PA;", "").replace("PU", "").replace("PD", "").rstrip(";").split(";")[:3]]
+dev = [tuple(int(t) for t in seg.split(",")) for seg in P.build_hpgl([(pts, False)], [(0, 0)], 10, 5, dict(CFG, swap_axes=True, mirror_carriage=True, overcut_mm=0)).decode().replace("IN;PA;", "").replace("PU", "").replace("PD", "").rstrip(";").split(";")[:3]]
 a, b, c = [phys(*d) for d in dev]
 cross = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
 check("front right cut reads normally (not mirrored) and upright", cross > 0 and b[0] > a[0] and c[1] > a[1], (a, b, c, cross))

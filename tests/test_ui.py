@@ -132,19 +132,45 @@ try:
 
             pg.click("#gear"); pg.wait_for_selector("#v-set:not([hidden])")
             check("settings: values loaded", pg.input_value("#s-width") == "22.992" and pg.input_value("#s-flow") == "none" and pg.input_value("#s-baud") == "9600", pg.input_value("#s-width"))
-            check("settings: raw switches hidden unless Custom", pg.is_hidden("#s-swap"))
-            pg.select_option("#s-orient", "custom"); pg.wait_for_selector("#s-swap")
-            pg.fill("#s-width", "15"); pg.check("#s-swap"); pg.click("#save")
+            check("settings: summary shows the start point", "front left" in pg.inner_text("#su-nowtxt"), pg.inner_text("#su-nowtxt"))
+            # Plotter setup: cut the setup test, pick the picture that matches, check
+            pg.click("#setup-open"); pg.wait_for_selector("#v-setup:not([hidden])")
+            pg.wait_for_function("document.querySelectorAll('#su-grid .tile').length === 8")
+            check("setup: 8 pictures", True)
+            pg.screenshot(path=os.path.join(OUT, "ui_setup.png"), full_page=True)
+            drain(0.2)
+            pg.click("#su-cut")
+            got = drain()
+            tp, tw, th = P.test_design()
+            check("setup test cut is the logo with no corrections at the start point", got == P.build_hpgl(tp, [(0.0, 0.0)], tw, th, dict(P.DEFAULTS)), got[:50])
+            # the picture for a front-right, ROTATE 90 plotter: top points left, not mirrored
+            idx = pg.evaluate("LAYOUTS.findIndex(l => l.corner[0] === 'right' && l.corner[1] === 'front' && l.a[0][1] === -1)")
+            pg.locator("#su-grid .tile").nth(idx).click()
+            check("setup: caption describes the picture", "Front right" in pg.locator("#su-grid .tile").nth(idx).inner_text() and "top points left" in pg.locator("#su-grid .tile").nth(idx).inner_text() and "not mirrored" in pg.locator("#su-grid .tile").nth(idx).inner_text(),
+                  pg.locator("#su-grid .tile").nth(idx).inner_text())
+            pg.click("#su-save"); pg.wait_for_selector("#su-done:not([hidden])")
+            saved = json.load(open(os.path.join(data_dir, "config.json")))
+            check("setup: front right saved as swap + mirror across", (saved["swap_axes"], saved["mirror_carriage"], saved["mirror_feed"]) == (True, True, False) and saved["start_corner"] == "origin", saved)
+            pg.screenshot(path=os.path.join(OUT, "ui_setup_done.png"), full_page=True)
+            pg.click("#back"); pg.wait_for_selector("#v-set:not([hidden])")
+            check("settings: summary now front right", "front right" in pg.inner_text("#su-nowtxt"), pg.inner_text("#su-nowtxt"))
+            # back to all-off through the manual switches, then swap only for the rest of this test
+            pg.click("#setup-open"); pg.wait_for_selector("#v-setup:not([hidden])")
+            pg.click("summary")
+            pg.uncheck("#s-mc"); pg.check("#s-swap"); pg.uncheck("#s-mf")
+            pg.click("#su-manual"); pg.wait_for_timeout(600)
+            pg.click("#back"); pg.wait_for_selector("#v-set:not([hidden])")
+            pg.fill("#s-width", "15"); pg.click("#save")
             pg.wait_for_function("document.querySelector('#setmsg').textContent === 'Saved.'")
             saved = json.load(open(os.path.join(data_dir, "config.json")))
-            check("settings: saved in mm", abs(saved["cut_width_mm"] - 381.0) < 1e-6 and saved["swap_axes"] is True, saved)
+            check("settings: saved in mm", abs(saved["cut_width_mm"] - 381.0) < 1e-6 and saved["swap_axes"] is True and saved["mirror_carriage"] is False, saved)
             pg.select_option("#s-units", "mm"); pg.click("#save")
             pg.wait_for_function("document.querySelector('#s-width').value === '381'")
             check("settings: unit switch keeps the real width", abs(json.load(open(os.path.join(data_dir, "config.json")))["cut_width_mm"] - 381.0) < 1e-6)
             pg.click("#test")
             got = drain()
             tp, tw, th = P.test_design()
-            expect_tp = P.build_hpgl(tp, [(0.0, 0.0)], tw, th, dict(P.DEFAULTS, orientation="custom", swap_axes=True))
+            expect_tp = P.build_hpgl(tp, [(0.0, 0.0)], tw, th, dict(P.DEFAULTS, swap_axes=True))
             check("settings: test logo sent (swapped axes)", got == expect_tp, got[:60])
             pg.screenshot(path=os.path.join(OUT, "ui_settings.png"), full_page=True)
             pg.fill("#s-width", ""); pg.click("#save")
@@ -279,7 +305,7 @@ try:
         check("thing: top-right button says Settings when idle", pc.inner_text("#km b") == "Settings")
         pc.keyboard.press("m")
         pc.wait_for_selector("#v-set:not([hidden])")
-        pc.wait_for_function("document.querySelectorAll('#slist li').length === 6")
+        pc.wait_for_function("document.querySelectorAll('#slist li').length === 5")
         pc.screenshot(path=os.path.join(OUT, "thing_settings.png"))
         w0 = json.load(open(cfgp))["vinyl_width_mm"]
         pc.keyboard.press("Enter")                       # edit vinyl width
@@ -290,16 +316,10 @@ try:
         pc.wait_for_timeout(400)
         w1 = json.load(open(cfgp))["vinyl_width_mm"]
         check("thing settings: dial changes the vinyl width by one step", 4.9 < w1 - w0 < 6.4, (w0, w1))
-        pc.mouse.wheel(30, 0); pc.wait_for_timeout(150)  # to Start jobs from
-        e0 = json.load(open(cfgp))["start_corner"]
+        pc.mouse.wheel(30, 0); pc.wait_for_timeout(150)  # to Screen sleep
         pc.keyboard.press("Enter"); pc.wait_for_timeout(500)
-        check("thing settings: start edge toggles", json.load(open(cfgp))["start_corner"] != e0)
-        pc.keyboard.press("Enter"); pc.wait_for_timeout(500)
-        pc.mouse.wheel(30, 0); pc.wait_for_timeout(150)  # to Start point (from Custom it goes to Front left first)
-        for _ in range(2):
-            if json.load(open(cfgp))["orientation"] == "right": break
-            pc.keyboard.press("Enter"); pc.wait_for_timeout(500)
-        check("thing settings: start point switches to front right", json.load(open(cfgp))["orientation"] == "right")
+        check("thing settings: screen sleep steps on", json.load(open(cfgp))["thing_sleep_min"] == 1)
+        pc.evaluate("post('/api/settings', {swap_axes: true, mirror_carriage: true, mirror_feed: false})")
         pc.keyboard.press("Escape")
         pc.wait_for_selector("#v-files:not([hidden])")
         check("thing: back leaves settings", True)
@@ -309,7 +329,7 @@ try:
         dot = pc.evaluate("(() => { const c = document.querySelector('#stage circle.org'); return [+c.getAttribute('cx'), S.pv.vinyl_width]; })()")
         check("thing: preview puts the start point on the right", abs(dot[0] - dot[1]) < 1e-6, dot)
         pc.screenshot(path=os.path.join(OUT, "thing_job_right.png"))
-        pc.evaluate("post('/api/settings', {orientation: 'left'})")
+        pc.evaluate("post('/api/settings', {swap_axes: false, mirror_carriage: false})")
         pc.keyboard.press("Escape")
         ct.close()
         br.close()
