@@ -40,7 +40,7 @@ except ImportError:       # Windows: only --car-thing-install is meant to run th
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.7"
+VERSION = "1.7.1"
 UNITS_PER_MM = 40.0          # CAMM-GL III step = 0.025 mm
 FLATTEN_TOL_MM = 0.03        # curve-to-line tolerance (about one cutter step)
 MAX_UPLOAD = 25 * 1024 * 1024
@@ -2489,6 +2489,10 @@ function pillDetail(){
 async function poll(){
   if(S.view === "login") return;
   try { S.status = await api("/api/status"); } catch(e){ S.status = null; }
+  if(S.status && S.status.version){
+    if(!S.loadedVersion) S.loadedVersion = S.status.version;
+    else if(S.status.version !== S.loadedVersion && !S.updating){ location.reload(); return; }   // the box was updated
+  }
   if(S.armed && Date.now() > S.armed) S.armed = 0;
   const jobs = S.status && S.status.vinyl ? S.status.vinyl.jobs : -1;
   if(jobs !== S.vjobs){ const first = S.vjobs === -1; S.vjobs = jobs; if(!first && S.view === "job") refreshPreview(); }
@@ -3228,6 +3232,10 @@ function paint(){
 async function poll(){
   if(S.view === "login") return;
   try { S.status = await api("/api/status"); } catch(e){ S.status = null; }
+  if(S.status && S.status.version){
+    if(!S.loadedVersion) S.loadedVersion = S.status.version;
+    else if(S.status.version !== S.loadedVersion){ location.reload(); return; }   /* the box was updated */
+  }
   var jobs = S.status && S.status.vinyl ? S.status.vinyl.jobs : -1;
   if(jobs !== S.vjobs){ var first = S.vjobs === -1; S.vjobs = jobs; if(!first && S.view === "job") refreshPreview(); }
   paint();

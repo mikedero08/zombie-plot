@@ -190,6 +190,10 @@ try:
         pc.goto("http://127.0.0.1:%d/thing" % PORT)
         pc.wait_for_selector("#list li.sel")
         pc.wait_for_function("document.querySelector('#pill').textContent.startsWith('Ready')")
+        pc.evaluate("S.loadedVersion = '0.0-old'")
+        pc.wait_for_function("S.loadedVersion && S.loadedVersion !== '0.0-old'", timeout=8000)
+        check("thing: reloads by itself when the box has been updated", True)
+        pc.wait_for_selector("#list li.sel")
         check("thing: logo and zombie on the status line", pc.is_visible("#bar .logo") and pc.is_visible("#bar .zombie"))
         check("thing: fits the screen with no scrolling page",
               pc.evaluate("document.documentElement.scrollWidth <= 800 && document.documentElement.scrollHeight <= 480"))
