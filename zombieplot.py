@@ -40,7 +40,7 @@ except ImportError:       # Windows: only --car-thing-install is meant to run th
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.7.1"
+VERSION = "1.8"
 UNITS_PER_MM = 40.0          # CAMM-GL III step = 0.025 mm
 FLATTEN_TOL_MM = 0.03        # curve-to-line tolerance (about one cutter step)
 MAX_UPLOAD = 25 * 1024 * 1024
@@ -63,7 +63,8 @@ DEFAULTS = {
     "overcut_mm": 1.0,         # matches the 1 mm overcut set in Inkcut
     "end_action": "origin",    # origin | next | advance
     "advance_mm": 25.0,
-    "swap_axes": False,
+    "orientation": "left",     # where the start point is, standing in front: left | right | custom
+    "swap_axes": False,        # the three below only count when orientation is "custom"
     "mirror_carriage": False,
     "mirror_feed": False,
     "px_per_inch": 96.0,       # only used for SVGs that carry no real-world units
@@ -130,6 +131,7 @@ VALIDATORS = {
     "overcut_mm": _num(0, 10),
     "end_action": _choice("origin", "next", "advance"),
     "advance_mm": _num(0, 1000),
+    "orientation": _choice("left", "right", "custom"),
     "swap_axes": _bool,
     "mirror_carriage": _bool,
     "mirror_feed": _bool,
@@ -156,7 +158,11 @@ class Config:
                         self.data[k] = VALIDATORS[k](v)
                     except (ValueError, TypeError):
                         pass
-        except (OSError, ValueError):
+            if "orientation" not in stored:
+                # Settings from before 1.8: work out which layout the three switches described.
+                flags = (self.data["swap_axes"], self.data["mirror_carriage"], self.data["mirror_feed"])
+                self.data["orientation"] = {(False, False, False): "left", (True, True, False): "right"}.get(flags, "custom")
+        except (OSError, ValueError, AttributeError):
             pass
 
     def snapshot(self):
@@ -780,11 +786,30 @@ def cut_length(polys):
     return total
 
 
+def machine_flags(cfg):
+    """(swap axes, mirror across, mirror along) for the plotter's layout.
+
+    Front left: the plotter's X axis runs across the vinyl from the start point (Roland ROTATE 0).
+    Front right: X runs along the vinyl and Y across, leftwards from the start point (Roland
+    ROTATE 90). Swapping the axes alone would mirror the cut, so a mirror across goes with it,
+    which together make the 90 degree turn."""
+    o = cfg.get("orientation", "left")
+    if o == "right":
+        return True, True, False
+    if o == "custom":
+        return cfg["swap_axes"], cfg["mirror_carriage"], cfg["mirror_feed"]
+    return False, False, False
+
+
+def origin_side(cfg):
+    return "right" if cfg.get("orientation") == "right" else "left"
+
+
 def build_hpgl(polys, offsets, job_w, job_h, cfg, base=(0.0, 0.0), park=None):
     """polys: one copy, already oriented. base: where the job's corner goes, in mm from
     the plotter's origin (across, along). park: where to leave the knife afterwards.
     Returns bytes ready to send."""
-    swap, mc, mf = cfg["swap_axes"], cfg["mirror_carriage"], cfg["mirror_feed"]
+    swap, mc, mf = machine_flags(cfg)
     upm = cfg.get("steps_per_mm", UNITS_PER_MM)
     bx, by = base
 
@@ -1459,11 +1484,11 @@ class App:
             items = self.session.snapshot()["items"]
             names = sorted({re.sub(r"(?i)\.svg$", "", items[i]["name"]) for i in clash if i < len(items)})
             warnings.insert(0, "This spot was already cut on this vinyl (%s). Choose Next free spot, "
-                               "or tap New vinyl if you loaded fresh vinyl or set a new start point."
+                               "or tap Clear Sheet Memory if you loaded fresh vinyl or set a new start point."
                             % ", ".join(names))
         bx = vinyl_w - cx - job_w if far else cx
         by = cy
-        mc = cfg["mirror_carriage"]
+        mc = machine_flags(cfg)[1]
         rects = [(bx + (job_w - ox - w if mc else ox), by + oy, w, h) for ox, oy in offsets]
         park = None
         if cfg["end_action"] == "next":
@@ -1484,7 +1509,8 @@ class App:
                 "offsets": p["offsets"], "job_w": p["job_w"], "job_h": p["job_h"],
                 "fits": p["fits"], "warnings": p["warnings"], "note": p["note"],
                 "cut_width": p["cfg"]["cut_width_mm"], "vinyl_width": p["vinyl_w"], "far": p["far"],
-                "place": p["place"], "base": p["base"], "clash": p["clash"],
+                "place": p["place"], "base": p["base"], "clash": p["clash"], "rects": p["rects"],
+                "origin_side": origin_side(p["cfg"]),
                 "used": self.session.snapshot()["items"],
                 "shapes": len(p["polys"]) * p["copies"],
                 "cut_length": cut_length(p["polys"]) * p["copies"],
@@ -1549,7 +1575,8 @@ class App:
                 "update": up if up and parse_version(up) > parse_version(VERSION) else None,
                 "vinyl": {"width_mm": min(self.cfg.get("vinyl_width_mm"), self.cfg.get("cut_width_mm")),
                           "used_mm": ses["used_mm"], "jobs": ses["jobs"],
-                          "units": self.cfg.get("units"), "start_corner": self.cfg.get("start_corner")},
+                          "units": self.cfg.get("units"), "start_corner": self.cfg.get("start_corner"),
+                          "origin_side": origin_side(self.cfg.snapshot()), "orientation": self.cfg.get("orientation")},
                 "thing_sleep_min": self.cfg.get("thing_sleep_min")}
 
 
@@ -2170,7 +2197,7 @@ h2{font-size:15px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)
   <div class="vtxt" id="vtxt">Vinyl</div>
   <button id="vwidth">Width</button>
   <button id="vundo" hidden>Undo last</button>
-  <button id="vnew">New vinyl</button>
+  <button id="vnew">Clear Sheet Memory</button>
 </div>
 
 <main id="v-login" hidden>
@@ -2213,7 +2240,7 @@ h2{font-size:15px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)
     <div class="seg"><button id="plc-auto" aria-pressed="true">Next free spot</button><button id="plc-origin" aria-pressed="false">At the start point</button></div>
   </div>
   <div class="seglbl">Start jobs from</div>
-  <div class="seg"><button id="crn-origin" aria-pressed="true">Left edge</button><button id="crn-far" aria-pressed="false">Right edge</button></div>
+  <div class="seg"><button id="crn-left" aria-pressed="true">Left edge</button><button id="crn-right" aria-pressed="false">Right edge</button></div>
   <div id="prog" hidden><div id="bar"></div></div>
   <div id="jobmsg" class="note"></div>
   <div class="cutrow">
@@ -2245,7 +2272,7 @@ h2{font-size:15px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)
   <h2>Vinyl</h2>
   <label class="f"><span id="l-vw">Usable vinyl width</span><input id="s-vw" inputmode="decimal"></label>
   <p class="note">How far across the plotter can cut on the vinyl loaded now. Change it when you load a different width.</p>
-  <label class="f">Start jobs from<select id="s-corner"><option value="origin">Left edge (the plotter's start point)</option><option value="far">Right edge</option></select></label>
+  <label class="f">Start jobs from<select id="s-corner"><option value="left">Left edge</option><option value="right">Right edge</option></select></label>
   <label class="f"><span id="l-gap">Gap between copies and jobs</span><input id="s-gap" inputmode="decimal"></label>
   <label class="f">When the job ends<select id="s-end"><option value="origin">Return to the start point</option><option value="next">Move to the next free spot</option><option value="advance">Feed the vinyl past the job</option></select></label>
   <label class="f">Overcut on closed shapes (mm)<input id="s-over" inputmode="decimal"></label>
@@ -2253,10 +2280,14 @@ h2{font-size:15px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)
 
   <h2>Plotter</h2>
   <label class="f"><span id="l-width">Widest the plotter can cut</span><input id="s-width" inputmode="decimal"></label>
-  <p class="note">Load scrap vinyl and cut the test square: the zombiePlot logo, a 2 inch square with "zP" inside. Standing in front of the plotter the P should read normally. If it is backwards, upside down or lying on its side, change these and cut it again.</p>
-  <label class="c"><input type="checkbox" id="s-swap">Swap the two axes</label>
-  <label class="c"><input type="checkbox" id="s-mc">Mirror left to right</label>
-  <label class="c"><input type="checkbox" id="s-mf">Mirror front to back</label>
+  <label class="f">Start point (origin), standing in front of the plotter<select id="s-orient"><option value="left">Front left</option><option value="right">Front right</option><option value="custom">Custom (other plotters)</option></select></label>
+  <p class="note">On a Roland CAMM-1, the panel setting ROTATE 0&deg; puts the start point front left and 90&deg; front right. To check: load scrap vinyl and cut the test logo, a 2 inch square with "zP" inside. Where you stand, it should read normally and start at the corner you chose.</p>
+  <div id="s-custom" hidden>
+    <p class="note">For plotters that are neither layout. Swap exchanges which plotter axis runs across the vinyl. On its own it mirrors the cut, so it is usually paired with one mirror; together they turn the cut 90&deg;.</p>
+    <label class="c"><input type="checkbox" id="s-swap">Swap the two axes</label>
+    <label class="c"><input type="checkbox" id="s-mc">Mirror across the vinyl</label>
+    <label class="c"><input type="checkbox" id="s-mf">Mirror along the vinyl</label>
+  </div>
   <button id="test" class="wide" style="margin-top:10px">Cut test square</button>
 
   <h2>Car Thing</h2>
@@ -2380,8 +2411,9 @@ async function refreshPreview(){
                         "&copies=" + S.copies + "&layout=" + S.layout + "&place=" + S.place);
     if(seq !== pvSeq) return;
     S.pv = p; S.rot = p.rot;
-    $("crn-origin").setAttribute("aria-pressed", !p.far);
-    $("crn-far").setAttribute("aria-pressed", !!p.far);
+    const edge = startEdge(p.far, p.origin_side);
+    $("crn-left").setAttribute("aria-pressed", edge === "left");
+    $("crn-right").setAttribute("aria-pressed", edge === "right");
     $("fname").textContent = p.name.replace(/\.svg$/i,"");
     $("plcrow").hidden = p.used.length === 0;
     draw(p);
@@ -2406,24 +2438,31 @@ async function refreshPreview(){
   paint();
 }
 
+// Which physical edge jobs start from: the start point's side, or the other one.
+function startEdge(far, originSide){ return far ? (originSide === "right" ? "left" : "right") : originSide; }
+
+// The preview is the vinyl as seen from the front of the plotter. Positions are measured across
+// the vinyl from the start point, so with the start point on the right they run right to left.
 function draw(p){
-  const VW = p.vinyl_width, bx = p.base[0], by = p.base[1];
-  const minX = Math.min(0, bx), maxX = Math.max(VW, bx + p.job_w);
+  const VW = p.vinyl_width, bx = p.base[0], by = p.base[1], right = p.origin_side === "right";
+  const sx = (a, w) => right ? VW - a - w : a;
+  const jx = sx(bx, p.job_w);
+  const minX = Math.min(0, jx), maxX = Math.max(VW, jx + p.job_w);
   let H = by + p.job_h;
   for(const u of p.used) H = Math.max(H, u.y + u.h);
   const W = maxX - minX, m = Math.max(W, H) * 0.05 + 1, fs = (W + 2*m) * 0.035;
   const top = H + m, bottom = -m - fs * 1.6;
   let used = "";
-  for(const u of p.used) used += '<rect class="used" x="' + u.x.toFixed(2) + '" y="' + u.y.toFixed(2) + '" width="' + u.w.toFixed(2) + '" height="' + u.h.toFixed(2) + '"/>';
+  for(const u of p.used) used += '<rect class="used" x="' + sx(u.x, u.w).toFixed(2) + '" y="' + u.y.toFixed(2) + '" width="' + u.w.toFixed(2) + '" height="' + u.h.toFixed(2) + '"/>';
   let uses = "";
-  for(const o of p.offsets) uses += '<use href="#one" x="' + (bx + o[0]).toFixed(2) + '" y="' + (by + o[1]).toFixed(2) + '"/>';
+  for(const q of p.rects) uses += '<use href="#one" x="' + sx(q[0], q[2]).toFixed(2) + '" y="' + q[1].toFixed(2) + '"/>';
   const r = Math.max(W, H) * 0.012;
   $("stage").className = p.clash ? "clash" : "";
   $("stage").innerHTML = '<svg viewBox="' + (minX - m) + " " + (-m) + " " + (W + 2*m) + " " + (top - bottom) + '" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Preview of the vinyl">' +
     '<g transform="translate(0,' + H + ') scale(1,-1)"><defs><path id="one" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" vector-effect="non-scaling-stroke" d="' + p.d + '"/></defs>' +
     '<path class="edge" d="M0 ' + top + 'V0H' + VW + 'V' + top + '"/>' + used +
-    '<rect class="jobbox" x="' + bx + '" y="' + by + '" width="' + p.job_w + '" height="' + p.job_h + '"/>' +
-    '<g>' + uses + '</g><circle class="org" r="' + r + '"/></g>' +
+    '<rect class="jobbox" x="' + jx + '" y="' + by + '" width="' + p.job_w + '" height="' + p.job_h + '"/>' +
+    '<g>' + uses + '</g><circle class="org" cx="' + (right ? VW : 0) + '" r="' + r + '"/></g>' +
     '<text class="lbl" x="0" y="' + (H + m + fs * 0.9) + '" font-size="' + fs + '">Left</text>' +
     '<text class="lbl" x="' + VW + '" y="' + (H + m + fs * 0.9) + '" font-size="' + fs + '" text-anchor="end">Right</text></svg>';
 }
@@ -2472,7 +2511,7 @@ function paint(){
     else if(job.state === "stopped" || job.state === "error") m = job.message;
   }
   if(S.view === "job") $("jobmsg").textContent = m;
-  for(const id of ["rot","mir","minus","plus","test","save","vnew","vundo","vwidth","lay-across","lay-stacked","plc-auto","plc-origin","crn-origin","crn-far","del"]) $(id).disabled = !!sending;
+  for(const id of ["rot","mir","minus","plus","test","save","vnew","vundo","vwidth","lay-across","lay-stacked","plc-auto","plc-origin","crn-left","crn-right","del"]) $(id).disabled = !!sending;
   if(sending && S.view === "set"){ $("up-install").disabled = true; $("up-back").disabled = true; }
 }
 
@@ -2520,7 +2559,9 @@ async function loadSettings(){
   $("l-gap").textContent = "Gap between copies and jobs (" + s.units + ")";
   $("l-vw").textContent = "Usable vinyl width (" + s.units + ")";
   $("s-width").value = +(s.cut_width_mm / u).toFixed(d); $("s-gap").value = +(s.copy_gap_mm / u).toFixed(d);
-  $("s-vw").value = +(s.vinyl_width_mm / u).toFixed(d); $("s-corner").value = s.start_corner;
+  $("s-vw").value = +(s.vinyl_width_mm / u).toFixed(d);
+  $("s-orient").value = s.orientation; $("s-custom").hidden = s.orientation !== "custom";
+  $("s-corner").value = startEdge(s.start_corner === "far", s.orientation === "right" ? "right" : "left");
   $("s-tsleep").value = String(s.thing_sleep_min);
   $("s-units").value = s.units; $("s-end").value = s.end_action; $("s-over").value = s.overcut_mm;
   $("s-swap").checked = s.swap_axes; $("s-mc").checked = s.mirror_carriage; $("s-mf").checked = s.mirror_feed;
@@ -2536,7 +2577,8 @@ async function saveSettings(){
   const u = S.settings.units === "mm" ? 1 : 25.4;
   const body = {
     cut_width_mm: parseFloat($("s-width").value) * u, copy_gap_mm: parseFloat($("s-gap").value) * u,
-    vinyl_width_mm: parseFloat($("s-vw").value) * u, start_corner: $("s-corner").value, thing_sleep_min: parseInt($("s-tsleep").value, 10),
+    vinyl_width_mm: parseFloat($("s-vw").value) * u, start_corner: $("s-corner").value === ($("s-orient").value === "right" ? "right" : "left") ? "origin" : "far",
+    orientation: $("s-orient").value, thing_sleep_min: parseInt($("s-tsleep").value, 10),
     units: $("s-units").value, end_action: $("s-end").value, overcut_mm: parseFloat($("s-over").value),
     swap_axes: $("s-swap").checked, mirror_carriage: $("s-mc").checked, mirror_feed: $("s-mf").checked,
     link: $("s-link").value, flow: $("s-flow").value, baud: parseInt($("s-baud").value, 10),
@@ -2636,11 +2678,14 @@ $("plus").onclick = () => { if(S.copies < 500){ S.copies++; refreshPreview(); } 
 $("lay-across").onclick = () => { S.layout = "across"; refreshPreview(); };
 $("lay-stacked").onclick = () => { S.layout = "stacked"; refreshPreview(); };
 $("plc-auto").onclick = () => { S.place = "auto"; refreshPreview(); };
-async function setCorner(c){
+async function setEdge(edge){
+  const c = edge === (S.pv ? S.pv.origin_side : "left") ? "origin" : "far";
   try { await post("/api/settings", {start_corner: c}); if(S.settings) S.settings.start_corner = c; refreshPreview(); }
   catch(e){ $("warns").innerHTML = '<div class="msg bad">' + esc(e.message) + "</div>"; }
 }
-$("crn-origin").onclick = () => setCorner("origin");
+$("crn-left").onclick = () => setEdge("left");
+$("crn-right").onclick = () => setEdge("right");
+$("s-orient").onchange = () => { $("s-custom").hidden = $("s-orient").value !== "custom"; };
 $("del").onclick = async () => {
   const name = S.pv ? S.pv.name : "this file";
   if(!confirm('Delete "' + name + '"? It is removed from the box and can\'t be undone.')) return;
@@ -2651,7 +2696,6 @@ $("del").onclick = async () => {
     setTimeout(() => { $("libmsg").hidden = true; $("libmsg").className = "msg bad"; }, 4000);
   } catch(e){ $("warns").innerHTML = '<div class="msg bad">' + esc(e.message) + "</div>"; }
 };
-$("crn-far").onclick = () => setCorner("far");
 $("plc-origin").onclick = () => { S.place = "origin"; refreshPreview(); };
 $("cut").onclick = doCut;
 $("stop").onclick = async () => { disarm(); try { await post("/api/stop"); } catch(e){ $("jobmsg").textContent = e.message; } poll(); };
@@ -2672,7 +2716,7 @@ $("vwidth").onclick = async () => {
   catch(e){ alert(e.message); }
 };
 $("vnew").onclick = async () => {
-  if(!confirm("Start fresh vinyl? This forgets where earlier jobs were cut. Do this after loading new vinyl or setting a new start point on the plotter.")) return;
+  if(!confirm("Clear sheet memory? This forgets where earlier jobs were cut on this sheet. Do it after loading new vinyl or setting a new start point on the plotter.")) return;
   try { await post("/api/session/new"); await poll(); if(S.view === "job"){ S.place = "auto"; refreshPreview(); } } catch(e){ alert(e.message); }
 };
 $("vundo").onclick = async () => {
@@ -2906,7 +2950,7 @@ button:disabled{opacity:.4}
 #keys .k{flex:1;display:flex;align-items:center;padding:0 8px;font-size:17px;color:var(--dim);white-space:nowrap;overflow:hidden}
 #keys .k i{font-style:normal;display:inline-block;min-width:22px;height:22px;line-height:20px;text-align:center;border:1px solid var(--line);
 border-radius:11px;font-size:13px;margin-right:6px;color:var(--dim)}
-#keys .k b{font-weight:600;color:var(--text);overflow:hidden;text-overflow:ellipsis}
+#keys .k b{font-weight:600;color:var(--text);overflow:hidden;white-space:normal;line-height:1.05;max-height:36px}
 #keys .k.on b{color:var(--go)}
 #keys .k.armed{background:var(--go)}#keys .k.armed b,#keys .k.armed i{color:var(--go-text);border-color:var(--go-text)}
 #keys .k.empty{visibility:hidden}
@@ -2930,6 +2974,14 @@ background:var(--panel);border:2px solid transparent}
 #list .n{flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:22px}
 #list .f{color:var(--dim);font-size:16px;margin-left:10px}
 #list .s{color:var(--dim);font-size:16px;margin-left:12px;white-space:nowrap}
+#slist{list-style:none;margin:0;padding:4px 74px 0 10px;height:318px;overflow-y:auto}
+#slist li{display:flex;align-items:center;height:48px;padding:0 14px;margin-bottom:4px;border-radius:10px;background:var(--panel);border:2px solid transparent;font-size:20px}
+#slist li.sel{border-color:var(--go)}
+#slist li.edit{border-color:var(--go);background:var(--go);color:var(--go-text)}
+#slist li.edit .v{color:var(--go-text)}
+#slist .l{flex:1}#slist .v{color:var(--dim);font-weight:600}
+#sethint{position:absolute;left:12px;bottom:8px;color:var(--dim);font-size:16px}
+#keys .k.m.cfg b{color:var(--text)}
 .hint{color:var(--dim);font-size:16px}
 #empty{padding:30px 24px;color:var(--dim)}
 #stage{position:absolute;left:10px;top:4px;bottom:10px;width:50%;background:var(--vinyl);border:1px solid var(--line);border-radius:10px}
@@ -2992,6 +3044,10 @@ border-left:5px solid var(--bad);font-size:19px;box-shadow:0 6px 24px rgba(0,0,0
       <button id="stop" style="margin-top:6px" hidden>STOP</button>
     </div>
   </section>
+  <section id="v-set" hidden>
+    <ul id="slist"></ul>
+    <div id="sethint">Dial: choose &middot; Press dial: change &middot; Back: done</div>
+  </section>
   <section id="v-login" hidden>
     <div class="l"><div style="font-size:26px;font-weight:650">Enter the PIN</div>
       <div class="hint">Set in zombiePlot's Settings on your phone.</div><div id="dots"></div></div>
@@ -3039,7 +3095,7 @@ function twice(what, fn){
 
 function show(view){
   S.view = view;
-  var vs = ["files", "job", "login"];
+  var vs = ["files", "job", "set", "login"];
   for(var i = 0; i < vs.length; i++) $("v-" + vs[i]).hidden = vs[i] !== view;
   paint();
 }
@@ -3125,23 +3181,26 @@ async function refreshPreview(){
   paint();
 }
 function draw(p){
-  var VW = p.vinyl_width, bx = p.base[0], by = p.base[1];
-  var minX = Math.min(0, bx), maxX = Math.max(VW, bx + p.job_w), H = by + p.job_h, i;
+  /* the vinyl as seen from the front; with the start point on the right, positions run right to left */
+  var VW = p.vinyl_width, bx = p.base[0], by = p.base[1], right = p.origin_side === "right";
+  function sx(a, w){ return right ? VW - a - w : a; }
+  var jx = sx(bx, p.job_w);
+  var minX = Math.min(0, jx), maxX = Math.max(VW, jx + p.job_w), H = by + p.job_h, i;
   for(i = 0; i < p.used.length; i++) H = Math.max(H, p.used[i].y + p.used[i].h);
   var W = maxX - minX, m = Math.max(W, H) * 0.05 + 1, top = H + m;
   var used = "", uses = "";
   for(i = 0; i < p.used.length; i++){
     var q = p.used[i];
-    used += '<rect class="used" x="' + q.x.toFixed(2) + '" y="' + q.y.toFixed(2) + '" width="' + q.w.toFixed(2) + '" height="' + q.h.toFixed(2) + '"/>';
+    used += '<rect class="used" x="' + sx(q.x, q.w).toFixed(2) + '" y="' + q.y.toFixed(2) + '" width="' + q.w.toFixed(2) + '" height="' + q.h.toFixed(2) + '"/>';
   }
-  for(i = 0; i < p.offsets.length; i++)
-    uses += '<use href="#one" xlink:href="#one" x="' + (bx + p.offsets[i][0]).toFixed(2) + '" y="' + (by + p.offsets[i][1]).toFixed(2) + '"/>';
+  for(i = 0; i < p.rects.length; i++)
+    uses += '<use href="#one" xlink:href="#one" x="' + sx(p.rects[i][0], p.rects[i][2]).toFixed(2) + '" y="' + p.rects[i][1].toFixed(2) + '"/>';
   $("stage").className = p.clash ? "clash" : "";
   $("stage").innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="' + (minX - m) + " " + (-m) + " " + (W + 2*m) + " " + (top + m) +
     '" preserveAspectRatio="xMidYMid meet"><g transform="translate(0,' + H + ') scale(1,-1)"><defs><path id="one" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" vector-effect="non-scaling-stroke" d="' + p.d + '"/></defs>' +
     '<path class="edge" d="M0 ' + top + 'V0H' + VW + 'V' + top + '"/>' + used +
-    '<rect class="jobbox" x="' + bx + '" y="' + by + '" width="' + p.job_w + '" height="' + p.job_h + '"/>' +
-    uses + '<circle class="org" r="' + (Math.max(W, H) * 0.015) + '"/></g></svg>';
+    '<rect class="jobbox" x="' + jx + '" y="' + by + '" width="' + p.job_w + '" height="' + p.job_h + '"/>' +
+    uses + '<circle class="org" cx="' + (right ? VW : 0) + '" r="' + (Math.max(W, H) * 0.015) + '"/></g></svg>';
 }
 function sending(){ var j = S.status && S.status.job; return !!(j && (j.state === "sending" || j.state === "stopping")); }
 function setCopies(n){
@@ -3169,11 +3228,11 @@ function keyMap(){
   var v = S.status && S.status.vinyl, busy = sending();
   if(S.view === "files") return [
     {label:"Refresh", run:loadFiles},
-    {label:armed("vnew") ? "Press again" : "New vinyl", armed:armed("vnew"), off:busy,
-     run:function(){ twice("vnew", async function(){ try { await post("/api/session/new"); toast("New vinyl: earlier cuts forgotten.", true); } catch(e){ toast(e.message); } poll(); }); }},
+    {label:armed("vnew") ? "Press again" : "Clear Sheet Memory", armed:armed("vnew"), off:busy,
+     run:function(){ twice("vnew", async function(){ try { await post("/api/session/new"); toast("Sheet memory cleared: earlier cuts forgotten.", true); } catch(e){ toast(e.message); } poll(); }); }},
     {label:armed("vundo") ? "Press again" : "Undo last", armed:armed("vundo"), off:busy || !(v && v.jobs),
      run:function(){ twice("vundo", async function(){ try { await post("/api/session/undo"); toast("Last job's area forgotten.", true); } catch(e){ toast(e.message); } poll(); }); }},
-    {label:(v && v.start_corner === "far" ? "Right edge" : "Left edge"), on:!!(v && v.start_corner === "far"), off:busy || !v,
+    {label:(v ? (startEdge(v.start_corner === "far", v.origin_side) === "right" ? "Right edge" : "Left edge") : "Left edge"), off:busy || !v,
      run:async function(){ try { await post("/api/settings", {start_corner: v.start_corner === "far" ? "origin" : "far"}); } catch(e){ toast(e.message); } poll(); }}];
   if(S.view === "job") return [
     {label:"Rotate " + (S.rot === "auto" ? 0 : S.rot) + "°", off:busy,
@@ -3217,7 +3276,9 @@ function paint(){
     el.style.opacity = k && k.off ? ".35" : "";
     el.lastChild.textContent = k ? k.label : "";
   }
-  $("km").className = "k m" + (busy ? "" : " empty");
+  $("km").className = "k m" + (busy ? "" : " cfg") + (!busy && S.view === "login" ? " empty" : "");
+  $("km").firstChild.textContent = busy ? "STOP" : (S.view === "set" ? "Done" : "Settings");
+  if(S.view === "set") paintSet();
 
   if(S.view === "job"){
     $("cntn").textContent = S.copies; $("cntl").textContent = S.copies === 1 ? "copy" : "copies";
@@ -3289,17 +3350,83 @@ async function unlock(){
   $("pad").appendChild(b);
 });
 
+/* ---------- settings screen (top-right button) ---------- */
+function startEdge(far, originSide){ return far ? (originSide === "right" ? "left" : "right") : originSide; }
+S.ssel = 0; S.sedit = null; S.cfg = null;
+function mkey(){
+  if(sending()){ stop(); return; }
+  if(S.view === "login") return;
+  if(S.view === "set"){ show("files"); loadFiles(); return; }
+  S.arm = null; S.ssel = 0; S.sedit = null; show("set"); loadSet();
+}
+async function loadSet(){
+  try { var r = await api("/api/settings"); S.cfg = r.settings; S.units = S.cfg.units; } catch(e){ toast(e.message); }
+  paintSet();
+}
+async function saveSet(obj, msg){
+  try { var r = await post("/api/settings", obj); S.cfg = r.settings; S.units = S.cfg.units; if(msg) toast(msg, true); }
+  catch(e){ toast(e.message); }
+  paintSet(); poll();
+}
+var SLEEPS = [0, 1, 2, 5, 10, 30];
+function setRows(){
+  var c = S.cfg;
+  if(!c) return [];
+  var oside = c.orientation === "right" ? "right" : "left";
+  var edge = startEdge(c.start_corner === "far", oside);
+  var vw = S.sedit !== null ? S.sedit : c.vinyl_width_mm;
+  return [
+    {label:"Vinyl width", value:len(Math.min(vw, c.cut_width_mm)), run:function(){
+       if(S.sedit === null){ S.sedit = c.vinyl_width_mm; paintSet(); }
+       else { var v = S.sedit; S.sedit = null; saveSet({vinyl_width_mm: v}, "Vinyl width saved."); } }},
+    {label:"Start jobs from", value:edge === "right" ? "Right edge" : "Left edge", run:function(){
+       var want = edge === "right" ? "left" : "right";
+       saveSet({start_corner: want === oside ? "origin" : "far"}); }},
+    {label:"Start point", value:c.orientation === "right" ? "Front right" : c.orientation === "left" ? "Front left" : "Custom", run:function(){
+       saveSet({orientation: c.orientation === "left" ? "right" : "left"}, "Start point changed. Cut the test logo to check."); }},
+    {label:"Screen sleep", value:c.thing_sleep_min ? c.thing_sleep_min + " min" : "Never", run:function(){
+       var i = SLEEPS.indexOf(+c.thing_sleep_min); saveSet({thing_sleep_min: SLEEPS[(i + 1) % SLEEPS.length]}); }},
+    {label:"Show sizes in", value:c.units === "mm" ? "mm" : "inches", run:function(){ saveSet({units: c.units === "mm" ? "in" : "mm"}); }},
+    {label:armed("test") ? "Press again to cut" : "Cut test logo", value:"2 in", armed:armed("test"), run:function(){
+       if(sending()) return;
+       twice("test", async function(){ try { await post("/api/cut", {id:"test", rot:0, mirror:false, copies:1}); toast("Test logo sent to the plotter.", true); } catch(e){ toast(e.message); } poll(); }); }}
+  ];
+}
+function paintSet(){
+  var rows = setRows(), ul = $("slist"), h = "";
+  S.ssel = Math.max(0, Math.min(rows.length - 1, S.ssel));
+  for(var i = 0; i < rows.length; i++){
+    var cls = i === S.ssel ? (S.sedit !== null && i === 0 ? "edit" : "sel") : "";
+    h += '<li class="' + cls + '"><span class="l">' + esc(rows[i].label) + '</span><span class="v">' + esc(rows[i].value) + '</span></li>';
+  }
+  ul.innerHTML = h;
+  for(var j = 0; j < ul.children.length; j++) (function(n){ ul.children[n].onclick = function(){ S.ssel = n; setEnter(); }; })(j);
+  if(ul.children[S.ssel]) ul.children[S.ssel].scrollIntoView({block:"nearest"});
+  $("sethint").textContent = S.sedit !== null ? "Dial: change width \u00b7 Press dial: save \u00b7 Back: cancel" : "Dial: choose \u00b7 Press dial: change \u00b7 Back: done";
+}
+function setTurn(d){
+  if(S.sedit !== null){
+    var step = S.units === "mm" ? 5 : 6.35;           /* 5 mm or a quarter inch per click */
+    S.sedit = Math.max(20, Math.min(S.cfg.cut_width_mm, Math.round((S.sedit + d * step) / step) * step));
+  } else S.ssel += d;
+  paintSet();
+}
+function setEnter(){ var r = setRows()[S.ssel]; if(r) r.run(); }
+
 /* ---------- Car Thing controls (and a keyboard, for trying it on a computer) ---------- */
 function turn(d){
+  if(S.view === "set"){ setTurn(d); return; }
   if(S.view === "files" && S.files.length){ S.sel = Math.max(0, Math.min(S.files.length - 1, S.sel + d)); paintSel(); }
   else if(S.view === "job") setCopies(S.copies + d);
 }
 function enter(){
+  if(S.view === "set"){ setEnter(); return; }
   if(S.view === "files") openFile();
   else if(S.view === "job" && !sending() && S.pv && S.pv.fits) twice("cut", doCut);
   else if(S.view === "login") unlock();
 }
 function back(){
+  if(S.view === "set"){ if(S.sedit !== null){ S.sedit = null; paintSet(); } else { show("files"); loadFiles(); } return; }
   if(S.view === "job"){ S.arm = null; S.id = null; S.pv = null; show("files"); loadFiles(); }
   else if(S.view === "login") pinKey("del");
 }
@@ -3308,7 +3435,7 @@ document.addEventListener("keydown", function(e){
   if(S.view === "login" && /^[0-9]$/.test(k)){ pinKey(k); e.preventDefault(); return; }
   var n = /^Digit[1-4]$/.test(c) ? +c.slice(5) : /^[1-4]$/.test(k) ? +k : 0;
   if(n){ press(n - 1); }
-  else if(c === "KeyM" || k === "m" || k === "M"){ if(sending()) stop(); }
+  else if(c === "KeyM" || k === "m" || k === "M"){ mkey(); }
   else if(k === "Escape" || k === "Backspace" || k === "BrowserBack") back();
   else if(k === "Enter" || k === " ") enter();
   else if(k === "ArrowDown" || k === "ArrowRight") turn(1);
@@ -3326,7 +3453,7 @@ document.addEventListener("wheel", function(e){
   turn(d > 0 ? 1 : -1);
 }, {passive:false});
 for(var i = 1; i <= 4; i++) (function(n){ $("k" + n).onclick = function(){ press(n - 1); }; })(i);
-$("km").onclick = function(){ if(sending()) stop(); };
+$("km").onclick = mkey;
 $("minus").onclick = function(){ setCopies(S.copies - 1); };
 $("plus").onclick = function(){ setCopies(S.copies + 1); };
 $("cut").onclick = function(){ if(S.pv && S.pv.fits) twice("cut", doCut); };

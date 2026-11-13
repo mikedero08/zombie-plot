@@ -121,7 +121,7 @@ try:
     check("stream is plain HP-GL", got.startswith(b"IN;PA;PU") and got.endswith(b"PU0,0;") and set(got) <= set(b"INPAUD0123456789,;"), got[:60])
 
     # --- settings ---
-    c, j = post("/api/settings", {"flow": "hardware", "cut_width_mm": 300, "units": "mm", "swap_axes": True})
+    c, j = post("/api/settings", {"flow": "hardware", "cut_width_mm": 300, "units": "mm", "swap_axes": True, "orientation": "custom"})
     check("settings saved", c == 200 and j["settings"]["flow"] == "hardware" and j["settings"]["cut_width_mm"] == 300.0)
     check("settings persisted to disk", json.load(open(os.path.join(data_dir, "config.json")))["swap_axes"] is True)
     c, j = post("/api/settings", {"baud": 1234}); check("bad setting rejected", c == 400 and "baud" in j["error"], j)
@@ -136,10 +136,10 @@ try:
     c, j = post("/api/cut", {"id": "test", "rot": 0, "mirror": False, "copies": 1})
     got = drain(master)
     tp, tw, th = P.test_design()
-    expect_tp = P.build_hpgl(tp, [(0.0, 0.0)], tw, th, dict(P.DEFAULTS, swap_axes=True, overcut_mm=0))
+    expect_tp = P.build_hpgl(tp, [(0.0, 0.0)], tw, th, dict(P.DEFAULTS, orientation="custom", swap_axes=True, overcut_mm=0))
     check("test logo (swapped axes)", c == 200 and got == expect_tp and abs(tw - 50.8) < 1e-6 and abs(th - 50.8) < 1e-6, got[:80])
     wait_state(("done", "error"))
-    post("/api/settings", {"swap_axes": False, "cut_width_mm": 584, "units": "in", "flow": "none"})
+    post("/api/settings", {"swap_axes": False, "orientation": "left", "cut_width_mm": 584, "units": "in", "flow": "none"})
 
     # --- stop in the middle of a job: fake plotter stops taking data ---
     c, j = post("/api/cut", {"id": ids["decal.svg"], "rot": 0, "mirror": False, "copies": 200})

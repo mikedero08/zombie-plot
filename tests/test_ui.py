@@ -101,12 +101,13 @@ try:
             pg.click("#vundo")
             pg.wait_for_function("document.querySelector('#vtxt').innerText.includes('1 job)')")
             check("undo last job", True)
-            pg.click("#crn-far")
-            pg.wait_for_function("document.querySelector('#crn-far').getAttribute('aria-pressed') === 'true'")
+            pg.click("#crn-right")
+            pg.wait_for_function("document.querySelector('#crn-right').getAttribute('aria-pressed') === 'true'")
             check("start edge switch on the cut screen saves the setting", json.load(open(os.path.join(data_dir, "config.json")))["start_corner"] == "far")
-            pg.click("#crn-origin")
-            pg.wait_for_function("document.querySelector('#crn-origin').getAttribute('aria-pressed') === 'true'")
+            pg.click("#crn-left")
+            pg.wait_for_function("document.querySelector('#crn-left').getAttribute('aria-pressed') === 'true'")
             check("and switches back", json.load(open(os.path.join(data_dir, "config.json")))["start_corner"] == "origin")
+            check("Clear Sheet Memory button", pg.inner_text("#vnew") == "Clear Sheet Memory")
             pg.click("#cut"); pg.wait_for_timeout(4600)
             _t = pg.inner_text("#cut"); _d = drain(0.3); check("cut: arming times out", _t == "CUT" and _d == b"", (_t, _d[:60], pg.inner_text("#jobmsg")))
             pg.click("#stop")
@@ -131,6 +132,8 @@ try:
 
             pg.click("#gear"); pg.wait_for_selector("#v-set:not([hidden])")
             check("settings: values loaded", pg.input_value("#s-width") == "22.992" and pg.input_value("#s-flow") == "none" and pg.input_value("#s-baud") == "9600", pg.input_value("#s-width"))
+            check("settings: raw switches hidden unless Custom", pg.is_hidden("#s-swap"))
+            pg.select_option("#s-orient", "custom"); pg.wait_for_selector("#s-swap")
             pg.fill("#s-width", "15"); pg.check("#s-swap"); pg.click("#save")
             pg.wait_for_function("document.querySelector('#setmsg').textContent === 'Saved.'")
             saved = json.load(open(os.path.join(data_dir, "config.json")))
@@ -141,7 +144,7 @@ try:
             pg.click("#test")
             got = drain()
             tp, tw, th = P.test_design()
-            expect_tp = P.build_hpgl(tp, [(0.0, 0.0)], tw, th, dict(P.DEFAULTS, swap_axes=True))
+            expect_tp = P.build_hpgl(tp, [(0.0, 0.0)], tw, th, dict(P.DEFAULTS, orientation="custom", swap_axes=True))
             check("settings: test logo sent (swapped axes)", got == expect_tp, got[:60])
             pg.screenshot(path=os.path.join(OUT, "ui_settings.png"), full_page=True)
             pg.fill("#s-width", ""); pg.click("#save")
@@ -272,6 +275,42 @@ try:
         pc.evaluate("lastInput = Date.now() - 3600000")
         pc.wait_for_timeout(1500)
         check("thing: never sleeps when set to Never", pc.is_hidden("#sleep"))
+        # top-right button: Settings when idle
+        check("thing: top-right button says Settings when idle", pc.inner_text("#km b") == "Settings")
+        pc.keyboard.press("m")
+        pc.wait_for_selector("#v-set:not([hidden])")
+        pc.wait_for_function("document.querySelectorAll('#slist li').length === 6")
+        pc.screenshot(path=os.path.join(OUT, "thing_settings.png"))
+        w0 = json.load(open(cfgp))["vinyl_width_mm"]
+        pc.keyboard.press("Enter")                       # edit vinyl width
+        pc.wait_for_selector("#slist li.edit")
+        pc.mouse.wheel(30, 0); pc.wait_for_timeout(150)
+        pc.keyboard.press("Enter")                       # save
+        pc.wait_for_function("!document.querySelector('#slist li.edit')")
+        pc.wait_for_timeout(400)
+        w1 = json.load(open(cfgp))["vinyl_width_mm"]
+        check("thing settings: dial changes the vinyl width by one step", 4.9 < w1 - w0 < 6.4, (w0, w1))
+        pc.mouse.wheel(30, 0); pc.wait_for_timeout(150)  # to Start jobs from
+        e0 = json.load(open(cfgp))["start_corner"]
+        pc.keyboard.press("Enter"); pc.wait_for_timeout(500)
+        check("thing settings: start edge toggles", json.load(open(cfgp))["start_corner"] != e0)
+        pc.keyboard.press("Enter"); pc.wait_for_timeout(500)
+        pc.mouse.wheel(30, 0); pc.wait_for_timeout(150)  # to Start point (from Custom it goes to Front left first)
+        for _ in range(2):
+            if json.load(open(cfgp))["orientation"] == "right": break
+            pc.keyboard.press("Enter"); pc.wait_for_timeout(500)
+        check("thing settings: start point switches to front right", json.load(open(cfgp))["orientation"] == "right")
+        pc.keyboard.press("Escape")
+        pc.wait_for_selector("#v-files:not([hidden])")
+        check("thing: back leaves settings", True)
+        pc.keyboard.press("Enter")
+        pc.wait_for_selector("#stage svg")
+        pc.wait_for_function("S.pv && S.pv.origin_side === 'right'")
+        dot = pc.evaluate("(() => { const c = document.querySelector('#stage circle.org'); return [+c.getAttribute('cx'), S.pv.vinyl_width]; })()")
+        check("thing: preview puts the start point on the right", abs(dot[0] - dot[1]) < 1e-6, dot)
+        pc.screenshot(path=os.path.join(OUT, "thing_job_right.png"))
+        pc.evaluate("post('/api/settings', {orientation: 'left'})")
+        pc.keyboard.press("Escape")
         ct.close()
         br.close()
 finally:

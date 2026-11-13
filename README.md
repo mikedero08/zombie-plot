@@ -120,16 +120,23 @@ To get an app icon:
 - **Android Chrome:** menu (three dots), **Add to Home screen**.
 - **iPhone Safari:** Share button, **Add to Home Screen**.
 
-## Step 6: Cut the test square
+## Step 6: Set the start point and cut the test logo
 
-1. Load scrap vinyl and set the start point on the cutter as you normally do.
-2. Open **Settings**, tap **Cut test square**. It cuts the zombiePlot logo: a 2 inch square with "zP" inside.
-3. Stand in front of the cutter and check the P:
-   - **Reads normally:** you're done.
-   - **Lying on its side:** tick **Swap the two axes** and cut again.
-   - **Backwards:** tick **Mirror left to right** and cut again.
-   - **Upside down:** tick **Mirror front to back** and cut again.
-4. Measure the square. It should be 2 inches.
+1. Look at where the cutter's start point (origin) is when you stand in front of it: the front left or the front right corner. On a Roland CAMM-1 the panel setting **ROTATE** decides it: 0° puts it front left, 90° front right.
+2. In **Settings → Plotter → Start point**, choose **Front left** or **Front right**.
+3. Load scrap vinyl and set the start point on the cutter as you normally do.
+4. Tap **Cut test square**. It cuts the zombiePlot logo: a 2 inch square with "zP" inside.
+5. Check it where you stand:
+   - **It reads normally and sits at the corner you chose:** you're done.
+   - **It's at the other corner, turned or mirrored:** the start point setting is wrong. Switch it and cut again.
+6. Measure the square. It should be 2 inches.
+
+Other plotters can use **Custom**, which shows three switches:
+- **Swap the two axes** exchanges which plotter axis runs across the vinyl. On its own it mirrors the cut, so it's normally paired with one mirror; together they turn it 90°.
+- **Mirror across the vinyl.**
+- **Mirror along the vinyl.**
+
+**Front right** is swap plus mirror across. **Front left** is all three off.
 
 ---
 
@@ -144,7 +151,7 @@ At the top right: **Ready** (green), **Not ready** (amber), or **No cable** (red
 The bar at the top shows the width of the vinyl loaded now and how much of it you've used.
 
 - **Width:** type the usable width of the vinyl, meaning how far across the cutter can cut on it. The cutter measures the vinyl when you load it, but it can't report that back over the cable, so the page needs you to enter it. Change it when you load a different width.
-- **New vinyl:** tap this after loading fresh vinyl or setting a new start point on the cutter. It forgets the areas already cut.
+- **Clear Sheet Memory:** tap this after loading fresh vinyl or setting a new start point on the cutter. It forgets the areas already cut.
 - **Undo last:** forgets the last job's area, if that job didn't actually cut.
 
 ### Cutting a file
@@ -163,7 +170,7 @@ The bar at the top shows the width of the vinyl loaded now and how much of it yo
 
 ### Where the page gets its positions
 
-All positions are measured from the cutter's start point (origin). The page moves each job by changing its coordinates; it never moves the cutter's start point. If you press the cutter's origin button, reload vinyl, or the vinyl slips, the remembered areas no longer line up with the vinyl. Tap **New vinyl** after any of those.
+All positions are measured from the cutter's start point (origin). The page moves each job by changing its coordinates; it never moves the cutter's start point. If you press the cutter's origin button, reload vinyl, or the vinyl slips, the remembered areas no longer line up with the vinyl. Tap **Clear Sheet Memory** after any of those.
 
 ---
 
@@ -173,13 +180,13 @@ All positions are measured from the cutter's start point (origin). The page move
 |---|---|---|
 | Access PIN | Without a PIN, anyone on your network can use the page. With one, each phone or computer asks for it once. | none |
 | Usable vinyl width | Same as Width on the vinyl bar. | Plotter width |
-| Start jobs from | The left edge of the vinyl (the plotter's start point), or the right edge. With the right edge, jobs sit against the opposite edge from the start point. Uses the vinyl width, so keep that accurate. | Left edge |
+| Start jobs from | The left or right edge of the vinyl, as you stand in front of the cutter. Jobs on the edge away from the start point use the vinyl width to find it, so keep that accurate. | the start point's edge |
 | Gap between copies and jobs | Space left between copies and between jobs. | 5 mm |
 | When the job ends | Return to the start point; move to the next free spot so you can see where the next job goes; or feed the vinyl past the job so you can cut it off. | Return |
 | Overcut on closed shapes | Cuts slightly past the start of each closed shape so the corner weeds cleanly. 0 turns it off. | 1 mm |
 | Show sizes in | Inches or millimetres. | inches |
 | Widest the plotter can cut | The machine's limit. The vinyl width can't be set wider than this. PNC-1210: 584 mm (23 in). | 584 mm |
-| Swap / Mirror | Orientation, set once with the test square. | off |
+| Start point | Front left or front right, as you stand in front of the cutter. Set once with the test logo. Custom shows the raw switches for other plotters. | Front left |
 | Cable type | Parallel or serial; automatic finds it. | automatic |
 | Flow control, Baud rate | Serial cables only; must match the cutter's serial settings. | Hardware, 9600 |
 | Port | `auto` finds the cable. | auto |
@@ -239,12 +246,14 @@ A Spotify Car Thing plugged into one of the Pi's USB ports becomes a remote that
 | **Press the dial** | open the file | CUT (press again within 4 seconds) |
 | **Back button** (under the dial) | | back to the files |
 | **Button 1** (top, leftmost) | refresh the list | rotate |
-| **Button 2** | new vinyl (press twice) | mirror |
+| **Button 2** | Clear Sheet Memory (press twice) | mirror |
 | **Button 3** | undo last (press twice) | side by side / stacked |
 | **Button 4** | start jobs from the left / right edge (shows Left edge or Right edge) | next free spot / start point |
-| **Top-right button** | STOP while a job is sending | STOP while a job is sending |
+| **Top-right button** | Settings; STOP while a job is sending | Settings; STOP while a job is sending |
 
 The top of the screen always shows what the four buttons do right now. Everything can also be tapped on the touchscreen.
+
+**Settings on the Car Thing:** the top-right button opens a settings screen. Turn the dial to choose a line and press it to change that line. **Vinyl width** goes into edit mode: turn to change it in quarter inches (5 mm), press to save, or press Back to cancel. The other lines are **Start jobs from**, **Start point**, **Screen sleep** and **Show sizes in**, plus **Cut test logo** (press twice). Back, or the top-right button again, returns to the files.
 
 **Screen sleep:** after 5 idle minutes the screen goes black. Change the time, or turn it off, in Settings → Car Thing. Any dial turn or button press wakes it, and that first touch only wakes it, so it can't start a cut by accident. It also wakes when a cut starts or finishes. The screen goes black, but its backlight stays on.
 

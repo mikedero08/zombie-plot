@@ -166,7 +166,7 @@ check("grid fewer copies than columns", (cols, rows) == (2, 1) and near(jw, 205)
 # 13. machine orientation flags
 sq = [([(0.0, 0.0), (10.0, 0.0), (10.0, 5.0)], False)]
 def hp(**kw):
-    c = dict(CFG); c.update(kw)
+    c = dict(CFG, orientation="custom"); c.update(kw)
     return P.build_hpgl(sq, [(0, 0)], 10, 5, c).decode()
 check("plain", hp() == "IN;PA;PU0,0;PD400,0;PD400,200;PU0,0;", hp())
 check("swap axes", hp(swap_axes=True) == "IN;PA;PU0,0;PD0,400;PD200,400;PU0,0;", hp(swap_axes=True))
@@ -174,6 +174,19 @@ check("mirror carriage", hp(mirror_carriage=True) == "IN;PA;PU400,0;PD0,0;PD0,20
 check("mirror feed", hp(mirror_feed=True) == "IN;PA;PU0,200;PD400,200;PD400,0;PU0,0;", hp(mirror_feed=True))
 check("advance", hp(end_action="advance").endswith("PU0,1200;"), hp(end_action="advance"))
 check("advance swapped", hp(end_action="advance", swap_axes=True).endswith("PU1200,0;"))
+# Start point front right (Roland ROTATE 90): swap + mirror across, which is a 90 degree turn, not a mirror.
+hr = P.build_hpgl(sq, [(0, 0)], 10, 5, dict(CFG, orientation="right")).decode()
+check("front right = swap + mirror across", hr == hp(swap_axes=True, mirror_carriage=True), (hr, hp(swap_axes=True, mirror_carriage=True)))
+check("front left = no change", P.build_hpgl(sq, [(0, 0)], 10, 5, dict(CFG, orientation="left", swap_axes=True)).decode() == hp(), "flags ignored unless custom")
+# handedness: a front-right layout must not mirror. Map drawing (x right, y back) through the flags and the
+# physical axes of a ROTATE 90 plotter (HPGL X toward the back, Y toward the left) and check the turn is proper.
+import itertools
+pts = [(0.0, 0.0), (10.0, 0.0), (0.0, 5.0)]
+def phys(u, v): return (-v, u)          # HPGL (X back, Y left) -> front view (right, back)
+dev = [tuple(int(t) for t in seg.split(",")) for seg in P.build_hpgl([(pts, False)], [(0, 0)], 10, 5, dict(CFG, orientation="right", overcut_mm=0)).decode().replace("IN;PA;", "").replace("PU", "").replace("PD", "").rstrip(";").split(";")[:3]]
+a, b, c = [phys(*d) for d in dev]
+cross = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+check("front right cut reads normally (not mirrored) and upright", cross > 0 and b[0] > a[0] and c[1] > a[1], (a, b, c, cross))
 
 # 14. overcut and closing
 ring = P.close_ring([(0, 0), (10, 0), (10, 10), (0, 10)], 0)
