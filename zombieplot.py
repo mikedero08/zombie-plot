@@ -40,7 +40,7 @@ except ImportError:       # Windows: only --car-thing-install is meant to run th
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.5"
+VERSION = "1.6"
 UNITS_PER_MM = 40.0          # CAMM-GL III step = 0.025 mm
 FLATTEN_TOL_MM = 0.03        # curve-to-line tolerance (about one cutter step)
 MAX_UPLOAD = 25 * 1024 * 1024
@@ -1339,6 +1339,24 @@ class App:
             raise UserError("That file is no longer there. Go back and refresh the list.")
         return full
 
+    def delete_file(self, file_id):
+        if file_id == "test":
+            raise UserError("The test cut is built in and can't be deleted.")
+        if self.jobs.busy():
+            raise UserError("Wait until the plotter has finished, then delete.")
+        full = self.resolve(file_id)
+        try:
+            os.remove(full)
+        except OSError as e:
+            if e.errno in (errno.EROFS, errno.EACCES, errno.EPERM):
+                raise UserError("That file is in a folder this box can only read (such as a network folder). "
+                                "Delete it on the computer that shares it.")
+            raise UserError("Could not delete that file (%s)." % e.strerror)
+        with self.cache_lock:
+            for k in [k for k in self.cache if k[0] == full]:
+                self.cache.pop(k, None)
+        return os.path.basename(full)
+
     def load(self, file_id):
         """Parsed drawing for a file id: (polys, w, h, warnings, display name)."""
         if file_id == "test":
@@ -1985,6 +2003,8 @@ class Handler(BaseHTTPRequestHandler):
                 if path == "/api/pin":
                     token = app.auth.set_pin(body.get("pin", ""))
                     return self._json_cookie({"ok": True, "pin_set": bool(token)}, token)
+                if path == "/api/delete":
+                    return self._json({"ok": True, "deleted": app.delete_file(body.get("id"))})
                 if path == "/api/cut":
                     return self._json(dict(app.cut(body), ok=True))
                 if path == "/api/update/check":
@@ -2036,7 +2056,7 @@ MANIFEST = json.dumps({
 })
 
 ICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96"><rect width="96" height="96" rx="20" '
-        'fill="#15181b"/><path d="M22 30h52M22 30v40h52V30M34 30v-8h28v8" fill="none" stroke="#f2a33a" '
+        'fill="#15181b"/><path d="M22 30h52M22 30v40h52V30M34 30v-8h28v8" fill="none" stroke="#86c35f" '
         'stroke-width="5" stroke-linejoin="round"/><path d="M34 58c8-14 20 6 28-8" fill="none" '
         'stroke="#e9edf0" stroke-width="5" stroke-linecap="round"/></svg>')
 
@@ -2052,10 +2072,10 @@ PAGE = r"""<!doctype html>
 <link rel="icon" href="/icon.svg">
 <title>zombiePlot</title>
 <style>
-:root{--bg:#15181b;--panel:#1e2327;--line:#30373d;--text:#e9edf0;--dim:#97a2ab;--go:#f2a33a;--go-text:#1a1305;
+:root{--bg:#15181b;--panel:#1e2327;--line:#30373d;--text:#e9edf0;--dim:#97a2ab;--go:#86c35f;--go-text:#10200a;
 --ok:#4fbf7b;--warn:#f2a33a;--bad:#ef5d52;--vinyl:#262c31}
 @media (prefers-color-scheme:light){:root{--bg:#f3f4f2;--panel:#fff;--line:#d5d9dc;--text:#181c1f;--dim:#5d6870;
---go:#c9720a;--go-text:#fff;--ok:#1f8a4c;--warn:#a85f00;--bad:#c5362c;--vinyl:#e8ebec}}
+--go:#4f8f33;--go-text:#fff;--ok:#1f8a4c;--warn:#a85f00;--bad:#c5362c;--vinyl:#e8ebec}}
 *{box-sizing:border-box}
 html,body{margin:0;background:var(--bg);color:var(--text);font:16px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 body{max-width:640px;margin:0 auto;padding:0 14px calc(20px + env(safe-area-inset-bottom));-webkit-tap-highlight-color:transparent}
@@ -2180,6 +2200,7 @@ h2{font-size:15px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)
     <button id="cut">CUT</button>
     <button id="stop">Stop</button>
   </div>
+  <button id="del" class="small wide" style="margin-top:22px;border-color:var(--bad);color:var(--bad)">Delete this file</button>
 </main>
 
 <main id="v-set" hidden>
@@ -2412,6 +2433,7 @@ function paint(){
   else if(st.port.state === "missing"){ cls = "bad"; txt = "No cable"; }
   else if(st.port.state === "notready"){ cls = "warn"; txt = "Not ready"; }
   else { cls = "ok"; txt = "Ready"; }
+  if(st && !sending && st.port.link && st.port.state !== "missing") txt += " \u00b7 " + (st.port.link === "serial" ? "SER" : "PAR");
   pill.className = cls; pill.lastChild.textContent = txt;
   paintVinyl();
   paintUpNote();
@@ -2429,7 +2451,7 @@ function paint(){
     else if(job.state === "stopped" || job.state === "error") m = job.message;
   }
   if(S.view === "job") $("jobmsg").textContent = m;
-  for(const id of ["rot","mir","minus","plus","test","save","vnew","vundo","vwidth","lay-across","lay-stacked","plc-auto","plc-origin","crn-origin","crn-far"]) $(id).disabled = !!sending;
+  for(const id of ["rot","mir","minus","plus","test","save","vnew","vundo","vwidth","lay-across","lay-stacked","plc-auto","plc-origin","crn-origin","crn-far","del"]) $(id).disabled = !!sending;
   if(sending && S.view === "set"){ $("up-install").disabled = true; $("up-back").disabled = true; }
 }
 
@@ -2594,6 +2616,16 @@ async function setCorner(c){
   catch(e){ $("warns").innerHTML = '<div class="msg bad">' + esc(e.message) + "</div>"; }
 }
 $("crn-origin").onclick = () => setCorner("origin");
+$("del").onclick = async () => {
+  const name = S.pv ? S.pv.name : "this file";
+  if(!confirm('Delete "' + name + '"? It is removed from the box and can\'t be undone.')) return;
+  try {
+    await post("/api/delete", {id: S.id});
+    S.id = null; S.pv = null; show("files"); await loadFiles();
+    $("libmsg").hidden = false; $("libmsg").className = "msg ok"; $("libmsg").textContent = "Deleted " + name + ".";
+    setTimeout(() => { $("libmsg").hidden = true; $("libmsg").className = "msg bad"; }, 4000);
+  } catch(e){ $("warns").innerHTML = '<div class="msg bad">' + esc(e.message) + "</div>"; }
+};
 $("crn-far").onclick = () => setCorner("far");
 $("plc-origin").onclick = () => { S.place = "origin"; refreshPreview(); };
 $("cut").onclick = doCut;
@@ -2836,7 +2868,7 @@ THING = r"""<!doctype html>
 /* Sized for the Car Thing's 800 x 480 screen and its old Chromium: no flex gap, no newer syntax.
    The dial overhangs the right edge of the screen: about the right 50 px, top 320 px. Nothing to
    read or press goes there (measured from a photo of a real Car Thing). */
-:root{--bg:#15181b;--panel:#1e2327;--line:#30373d;--text:#e9edf0;--dim:#97a2ab;--go:#f2a33a;--go-text:#1a1305;
+:root{--bg:#15181b;--panel:#1e2327;--line:#30373d;--text:#e9edf0;--dim:#97a2ab;--go:#86c35f;--go-text:#10200a;
 --ok:#4fbf7b;--warn:#f2a33a;--bad:#ef5d52;--vinyl:#262c31}
 *{box-sizing:border-box}
 html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--text);
@@ -3114,7 +3146,7 @@ function keyMap(){
      run:function(){ twice("vnew", async function(){ try { await post("/api/session/new"); toast("New vinyl: earlier cuts forgotten.", true); } catch(e){ toast(e.message); } poll(); }); }},
     {label:armed("vundo") ? "Press again" : "Undo last", armed:armed("vundo"), off:busy || !(v && v.jobs),
      run:function(){ twice("vundo", async function(){ try { await post("/api/session/undo"); toast("Last job's area forgotten.", true); } catch(e){ toast(e.message); } poll(); }); }},
-    {label:"From " + (v && v.start_corner === "far" ? "right edge" : "left edge"), on:!!(v && v.start_corner === "far"), off:busy || !v,
+    {label:(v && v.start_corner === "far" ? "Right edge" : "Left edge"), on:!!(v && v.start_corner === "far"), off:busy || !v,
      run:async function(){ try { await post("/api/settings", {start_corner: v.start_corner === "far" ? "origin" : "far"}); } catch(e){ toast(e.message); } poll(); }}];
   if(S.view === "job") return [
     {label:"Rotate " + (S.rot === "auto" ? 0 : S.rot) + "°", off:busy,
@@ -3141,6 +3173,7 @@ function paint(){
   else if(st.port.state === "missing"){ cls = "bad"; txt = "No cable"; }
   else if(st.port.state === "notready"){ cls = "warn"; txt = "Not ready"; }
   else { cls = "ok"; txt = "Ready"; }
+  if(st && !busy && st.port.link && st.port.state !== "missing") txt += " \u00b7 " + (st.port.link === "serial" ? "SER" : "PAR");
   pill.className = cls; pill.textContent = txt;
   var v = st && st.vinyl;
   if(v){

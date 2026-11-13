@@ -174,6 +174,12 @@ try:
     c, j = post("/api/upload?name=" + urllib.parse.quote("../../evil.svg"), raw=SVG_A)
     check("upload name is confined", c == 200 and j["id"] == "up:evil.svg" and not os.path.exists(os.path.join(tmp, "evil.svg")), j)
     c, j = post("/api/upload?name=x.svg", raw=b"this is not an svg"); check("upload rejects non-svg content", c == 400, j)
+    c, j = post("/api/upload?name=" + urllib.parse.quote("to delete.svg"), raw=SVG_A)
+    c, j = post("/api/delete", {"id": "up:to delete.svg"})
+    check("delete removes an uploaded file", c == 200 and not os.path.exists(os.path.join(data_dir, "uploads", "to delete.svg")), j)
+    c, j = post("/api/delete", {"id": "up:to delete.svg"}); check("deleting it again reports it is gone", c == 400, j)
+    c, j = post("/api/delete", {"id": "lib:../secret.svg"}); check("delete refuses paths outside the folders", c == 400 and os.path.exists(os.path.join(tmp, "secret.svg")), j)
+    c, j = post("/api/delete", {"id": "test"}); check("built-in test cut cannot be deleted", c == 400, j)
     c, j = post("/api/upload?name=x.exe", raw=SVG_A); check("upload rejects other extensions", c == 400, j)
     c, fl = getj("/api/files"); check("uploads listed first", fl["files"][0]["folder"] == "Sent from phone", fl["files"][0])
 

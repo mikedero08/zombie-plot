@@ -45,6 +45,8 @@ try:
     check("POST without page header refused (cross-site protection)", c == 403 and "did not come from" in j["error"], (c, j))
     c, j, _ = req("POST", "/api/cut", b'{"id":"lib:a.svg"}', {"Content-Type": "text/plain"})
     check("text/plain form-style POST refused", c == 403)
+    c, j, _ = req("POST", "/api/delete", {"id": "lib:a.svg"})
+    check("delete without page header refused", c == 403 and os.path.exists(os.path.join(lib, "a.svg")))
     c, j, _ = req("POST", "/api/upload?name=x.svg", b"<svg/>")
     check("upload without header refused", c == 403)
     c, j, _ = req("GET", "/api/files", headers={"Host": "evil.com"})

@@ -135,6 +135,10 @@ To get an app icon:
 
 ## Using it
 
+### The status light
+
+At the top right: **Ready** (green), **Not ready** (amber), or **No cable** (red). After it comes **PAR** or **SER**, showing whether the cutter is connected through a parallel or a serial cable. Tap it for details.
+
 ### The vinyl bar
 
 The bar at the top shows the width of the vinyl loaded now and how much of it you've used.
@@ -145,7 +149,7 @@ The bar at the top shows the width of the vinyl loaded now and how much of it yo
 
 ### Cutting a file
 
-1. Tap a file. The preview shows the whole vinyl width, the start point (orange dot), areas already cut (grey), and the new job.
+1. Tap a file. The preview shows the whole vinyl width, the start point (green dot), areas already cut (grey), and the new job.
 2. Under the preview: the size of one copy, and the total size when there's more than one.
 3. **Rotate** turns it a quarter turn per tap. **Mirror** flips it, for decals applied inside glass.
 4. **- / +** sets the number of copies. **Side by side** fills across the vinyl first. **Stacked** puts them one after another along the vinyl.
@@ -155,6 +159,7 @@ The bar at the top shows the width of the vinyl loaded now and how much of it yo
    - **At the start point** cuts at the start point, and warns you if that area was already used.
 7. Tap **CUT**, then tap it again within 4 seconds. The second tap stops a stray touch from wasting vinyl.
 8. **Stop** stops sending and tells the cutter to drop the rest of the job.
+9. **Delete this file**, at the bottom, removes the file from the box after you confirm. Files in a network folder can't be deleted from here; the box can only read that folder.
 
 ### Where the page gets its positions
 
@@ -236,7 +241,7 @@ A Spotify Car Thing plugged into one of the Pi's USB ports becomes a remote that
 | **Button 1** (top, leftmost) | refresh the list | rotate |
 | **Button 2** | new vinyl (press twice) | mirror |
 | **Button 3** | undo last (press twice) | side by side / stacked |
-| **Button 4** | start jobs from the left / right edge | next free spot / start point |
+| **Button 4** | start jobs from the left / right edge (shows Left edge or Right edge) | next free spot / start point |
 | **Top-right button** | STOP while a job is sending | STOP while a job is sending |
 
 The top of the screen always shows what the four buttons do right now. Everything can also be tapped on the touchscreen.
