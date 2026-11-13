@@ -135,7 +135,9 @@ try:
     post("/api/session/new"); post("/api/settings", {"overcut_mm": 0})
     c, j = post("/api/cut", {"id": "test", "rot": 0, "mirror": False, "copies": 1})
     got = drain(master)
-    check("test square", c == 200 and got.startswith(b"IN;PA;PU0,0;PD0,2032;PD2032,2032;PD2032,0;PD0,0;") and b"PU400,600;PD1600,600;PD1600,1400;PU1040,1160;PD1040,600;PU0,0;" in got, got)
+    tp, tw, th = P.test_design()
+    expect_tp = P.build_hpgl(tp, [(0.0, 0.0)], tw, th, dict(P.DEFAULTS, swap_axes=True, overcut_mm=0))
+    check("test logo (swapped axes)", c == 200 and got == expect_tp and abs(tw - 50.8) < 1e-6 and abs(th - 50.8) < 1e-6, got[:80])
     wait_state(("done", "error"))
     post("/api/settings", {"swap_axes": False, "cut_width_mm": 584, "units": "in", "flow": "none"})
 

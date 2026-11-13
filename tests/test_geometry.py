@@ -206,7 +206,7 @@ check("open paths reversed to nearest end", o[0][0][0] == (0.0, 0.0) and o[1][0]
 
 # 16. test pattern and errors
 tp, w, h = P.test_design()
-check("test design size", (w, h) == (50.8, 50.8) and len(tp) == 3)
+check("test design size (logo)", abs(w - 50.8) < 1e-6 and abs(h - 50.8) < 1e-6 and len(tp) == 4, (w, h, len(tp)))
 for bad in (b"not xml", b"<html></html>", svg("")):
     try:
         P.parse_svg(bad); check("bad svg rejected", False, bad)

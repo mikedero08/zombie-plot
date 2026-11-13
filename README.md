@@ -123,8 +123,8 @@ To get an app icon:
 ## Step 6: Cut the test square
 
 1. Load scrap vinyl and set the start point on the cutter as you normally do.
-2. Open **Settings**, tap **Cut test square**. It cuts a 2 inch square with a letter F inside.
-3. Stand in front of the cutter and check the F:
+2. Open **Settings**, tap **Cut test square**. It cuts the zombiePlot logo: a 2 inch square with "zP" inside.
+3. Stand in front of the cutter and check the P:
    - **Reads normally:** you're done.
    - **Lying on its side:** tick **Swap the two axes** and cut again.
    - **Backwards:** tick **Mirror left to right** and cut again.
@@ -149,11 +149,12 @@ The bar at the top shows the width of the vinyl loaded now and how much of it yo
 2. Under the preview: the size of one copy, and the total size when there's more than one.
 3. **Rotate** turns it a quarter turn per tap. **Mirror** flips it, for decals applied inside glass.
 4. **- / +** sets the number of copies. **Side by side** fills across the vinyl first. **Stacked** puts them one after another along the vinyl.
-5. **Where on the vinyl:**
+5. **Start jobs from** the left or right edge of the vinyl. It's the same setting as in Settings, here so you don't have to switch screens.
+6. **Where on the vinyl:**
    - **Next free spot** (normal) places the job clear of everything already cut.
    - **At the start point** cuts at the start point, and warns you if that area was already used.
-6. Tap **CUT**, then tap it again within 4 seconds. The second tap stops a stray touch from wasting vinyl.
-7. **Stop** stops sending and tells the cutter to drop the rest of the job.
+7. Tap **CUT**, then tap it again within 4 seconds. The second tap stops a stray touch from wasting vinyl.
+8. **Stop** stops sending and tells the cutter to drop the rest of the job.
 
 ### Where the page gets its positions
 
@@ -235,10 +236,12 @@ A Spotify Car Thing plugged into one of the Pi's USB ports becomes a remote that
 | **Button 1** (top, leftmost) | refresh the list | rotate |
 | **Button 2** | new vinyl (press twice) | mirror |
 | **Button 3** | undo last (press twice) | side by side / stacked |
-| **Button 4** | | next free spot / start point |
+| **Button 4** | start jobs from the left / right edge | next free spot / start point |
 | **Top-right button** | STOP while a job is sending | STOP while a job is sending |
 
 The top of the screen always shows what the four buttons do right now. Everything can also be tapped on the touchscreen.
+
+**Screen sleep:** after 5 idle minutes the screen goes black. Change the time, or turn it off, in Settings → Car Thing. Any dial turn or button press wakes it, and that first touch only wakes it, so it can't start a cut by accident. It also wakes when a cut starts or finishes. The screen goes black, but its backlight stays on.
 
 ### What you need
 

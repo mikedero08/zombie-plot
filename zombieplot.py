@@ -40,7 +40,7 @@ except ImportError:       # Windows: only --car-thing-install is meant to run th
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.4.2"
+VERSION = "1.5"
 UNITS_PER_MM = 40.0          # CAMM-GL III step = 0.025 mm
 FLATTEN_TOL_MM = 0.03        # curve-to-line tolerance (about one cutter step)
 MAX_UPLOAD = 25 * 1024 * 1024
@@ -70,6 +70,7 @@ DEFAULTS = {
     "units": "in",             # display units: in | mm
     "init": "IN;PA;",
     "auto_update": False,
+    "thing_sleep_min": 5,      # Car Thing screen goes dark after this many idle minutes (0 = never)
     "pin_hash": "",            # set through /api/pin only
     "steps_per_mm": 40.0,      # plotter units per mm (HP-GL / Roland CAMM-GL: 40)
 }
@@ -136,6 +137,7 @@ VALIDATORS = {
     "units": _choice("in", "mm"),
     "init": _init,
     "auto_update": _bool,
+    "thing_sleep_min": lambda v: int(_num(0, 240)(v)),
     "pin_hash": lambda v: str(v) if re.match(r"^(|pbkdf2\$\d+\$[0-9a-f]+\$[0-9a-f]+)$", str(v)) else _raise(),
 }
 
@@ -829,17 +831,15 @@ def preview_path(polys, eps):
     return "".join(parts)
 
 
-TEST_SIZE = 50.8   # 2 inch square with a letter F in it
+TEST_SIZE = 50.8   # the zombiePlot logo: a 2 inch square with "zP" inside
+
+# The project logo, exported from VCarve. The P shows mirroring and rotation at a glance.
+TEST_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" width="10in" height="5in" viewBox="0 0 10 5"><path d="M 4.080801,3.565224 L 6.080801,3.565224 L 6.080801,1.565224 L 4.080801,1.565224 L 4.080801,3.565224"/><path d="M 4.467823,3.195346 C 4.464412,3.195346 4.461426,3.194067 4.458868,3.191508 C 4.456309,3.188949 4.455029,3.185538 4.455029,3.181273 L 4.456309,3.153126 C 4.456309,3.130096 4.453750,3.107493 4.448632,3.085317 C 4.446926,3.072523 4.445220,3.060155 4.443515,3.048214 C 4.441809,3.036273 4.437117,3.026250 4.429441,3.018147 C 4.421764,3.010045 4.417926,3.000022 4.417926,2.988081 L 4.419206,2.957375 C 4.419206,2.938611 4.418353,2.921125 4.416647,2.904919 C 4.414941,2.892978 4.413662,2.879757 4.412809,2.865257 C 4.412809,2.845640 4.416860,2.827728 4.424963,2.811522 C 4.433066,2.795316 4.442235,2.779963 4.452470,2.765463 L 4.516441,2.666948 C 4.557382,2.604683 4.596405,2.543271 4.633508,2.482712 C 4.670611,2.422153 4.694706,2.374815 4.705795,2.340697 L 4.705795,2.331741 C 4.705795,2.320653 4.701530,2.310205 4.693000,2.300396 C 4.684471,2.290587 4.674662,2.285682 4.663574,2.285682 L 4.643103,2.285682 L 4.566338,2.283124 C 4.544162,2.283124 4.524971,2.287602 4.508765,2.296558 C 4.492559,2.305513 4.484243,2.324705 4.483816,2.354131 C 4.483390,2.383558 4.482537,2.406374 4.481257,2.422580 C 4.479978,2.438786 4.478272,2.450301 4.476140,2.457124 C 4.474007,2.463948 4.471875,2.468426 4.469743,2.470558 C 4.467610,2.472690 4.464838,2.473756 4.461426,2.473756 C 4.454603,2.473756 4.450125,2.470131 4.447992,2.462881 C 4.445860,2.455631 4.444794,2.446036 4.444794,2.434095 L 4.446073,2.394433 C 4.446073,2.370550 4.443088,2.344536 4.437117,2.316388 C 4.435412,2.309565 4.433492,2.296344 4.431360,2.276727 C 4.429228,2.257109 4.427309,2.235999 4.425603,2.213396 C 4.423897,2.190793 4.423044,2.172241 4.423044,2.157741 C 4.423897,2.127888 4.431360,2.108057 4.445434,2.098248 C 4.459507,2.088439 4.481471,2.083535 4.511324,2.083535 L 4.593206,2.086094 C 4.613677,2.085241 4.632441,2.084175 4.649500,2.082895 C 4.666559,2.081616 4.685324,2.080976 4.705795,2.080976 L 4.749295,2.080976 C 4.784265,2.080976 4.812412,2.080123 4.833736,2.078417 L 4.873398,2.077138 C 4.899839,2.077138 4.922442,2.083535 4.941207,2.096329 C 4.945472,2.099741 4.948244,2.103792 4.949523,2.108484 C 4.950803,2.113175 4.952722,2.116800 4.955280,2.119359 C 4.966369,2.131300 4.973832,2.144520 4.977670,2.159020 C 4.981508,2.173520 4.984281,2.188020 4.985986,2.202521 C 4.986839,2.212756 4.988119,2.222351 4.989825,2.231307 C 4.991531,2.240263 4.992383,2.249006 4.992383,2.257535 C 4.992383,2.273741 4.990678,2.289947 4.987266,2.306153 C 4.983001,2.329183 4.980869,2.352212 4.980869,2.375242 L 4.982148,2.434095 C 4.982148,2.448595 4.980869,2.462881 4.978310,2.476955 C 4.975751,2.491029 4.974472,2.505315 4.974472,2.519815 L 4.974472,2.535168 C 4.974472,2.538580 4.973406,2.541352 4.971273,2.543485 C 4.969141,2.545617 4.966369,2.546683 4.962957,2.546683 C 4.956133,2.546683 4.952722,2.541992 4.952722,2.532610 C 4.951016,2.507874 4.947178,2.483139 4.941207,2.458403 C 4.937795,2.438786 4.934810,2.418315 4.932251,2.396992 C 4.932251,2.393580 4.930972,2.391021 4.928413,2.389315 C 4.900266,2.419168 4.877236,2.452859 4.859324,2.490389 C 4.853354,2.502330 4.846530,2.512779 4.838854,2.521735 C 4.831177,2.530690 4.824354,2.539860 4.818383,2.549242 C 4.813265,2.561183 4.769339,2.634963 4.686603,2.770581 L 4.684045,2.774419 C 4.679780,2.780390 4.677647,2.785081 4.677647,2.788493 C 4.677647,2.792757 4.680206,2.796595 4.685324,2.800007 C 4.690442,2.803419 4.695986,2.805125 4.701956,2.805125 L 4.737780,2.803845 L 4.810707,2.805125 C 4.833736,2.805125 4.849089,2.804272 4.856766,2.802566 L 4.868280,2.801287 C 4.890457,2.801287 4.911994,2.806191 4.932891,2.816000 C 4.953788,2.825809 4.964236,2.843934 4.964236,2.870375 C 4.964236,2.880610 4.963597,2.890419 4.962317,2.899802 C 4.961038,2.909184 4.960398,2.918140 4.960398,2.926669 L 4.961678,2.954816 C 4.961678,2.974434 4.958692,2.997890 4.952722,3.025184 C 4.946751,3.052478 4.943766,3.078920 4.943766,3.104508 L 4.945045,3.128817 C 4.945045,3.143317 4.938648,3.151420 4.925854,3.153126 C 4.920736,3.153126 4.917111,3.149714 4.914979,3.142890 C 4.912847,3.136067 4.909648,3.120287 4.905383,3.095552 C 4.896001,3.064846 4.878942,3.040537 4.854207,3.022625 C 4.851648,3.020067 4.849089,3.018787 4.846530,3.018787 L 4.820942,3.021346 C 4.813265,3.021346 4.805376,3.020920 4.797273,3.020067 C 4.789170,3.019214 4.780854,3.018787 4.772324,3.018787 C 4.762089,3.018787 4.751640,3.019640 4.740978,3.021346 C 4.730317,3.023052 4.719442,3.023905 4.708353,3.023905 C 4.691295,3.023905 4.675942,3.023265 4.662294,3.021986 C 4.648647,3.020706 4.634574,3.019640 4.620074,3.018787 C 4.606427,3.018787 4.592993,3.019640 4.579772,3.021346 C 4.566552,3.023052 4.553544,3.023905 4.540750,3.023905 L 4.517721,3.022625 L 4.508765,3.021346 C 4.498529,3.021346 4.492985,3.034567 4.492132,3.061008 L 4.490853,3.094273 C 4.490853,3.119008 4.488294,3.145023 4.483176,3.172317 L 4.480618,3.181273 C 4.477206,3.190655 4.472941,3.195346 4.467823,3.195346"/><path d="M 5.048516,1.935102 L 5.375879,1.935102 C 5.464411,1.935102 5.532483,1.942051 5.580094,1.955948 C 5.627706,1.969846 5.663479,1.989920 5.687414,2.016171 C 5.711348,2.042421 5.727562,2.074205 5.736055,2.111523 C 5.744548,2.148840 5.748794,2.206617 5.748794,2.284855 L 5.748794,2.393718 C 5.748794,2.473500 5.740559,2.531664 5.724088,2.568209 C 5.707616,2.604754 5.677377,2.632806 5.633368,2.652366 C 5.589359,2.671925 5.531839,2.681705 5.460808,2.681705 L 5.373562,2.681705 L 5.373562,3.185102 L 5.048516,3.185102 L 5.048516,1.935102"/><path d="M 5.373562,2.148969 L 5.373562,2.467066 C 5.382827,2.467581 5.390806,2.467838 5.397497,2.467838 C 5.427351,2.467838 5.448068,2.460503 5.459650,2.445834 C 5.471231,2.431164 5.477021,2.400667 5.477021,2.354342 L 5.477021,2.251655 C 5.477021,2.208934 5.470330,2.181139 5.456947,2.168271 C 5.443565,2.155403 5.415770,2.148969 5.373562,2.148969"/></svg>')
 
 
 def test_design():
-    s = TEST_SIZE
-    polys = [
-        ([(0.0, 0.0), (s, 0.0), (s, s), (0.0, s)], True),
-        ([(35.0, 40.0), (15.0, 40.0), (15.0, 10.0)], False),
-        ([(15.0, 26.0), (29.0, 26.0)], False),
-    ]
-    return polys, s, s
+    polys, w, h, _ = parse_svg(TEST_SVG.encode("ascii"))
+    return polys, w, h
 
 
 # ----------------------------------------------------------------------------
@@ -1531,7 +1531,8 @@ class App:
                 "update": up if up and parse_version(up) > parse_version(VERSION) else None,
                 "vinyl": {"width_mm": min(self.cfg.get("vinyl_width_mm"), self.cfg.get("cut_width_mm")),
                           "used_mm": ses["used_mm"], "jobs": ses["jobs"],
-                          "units": self.cfg.get("units")}}
+                          "units": self.cfg.get("units"), "start_corner": self.cfg.get("start_corner")},
+                "thing_sleep_min": self.cfg.get("thing_sleep_min")}
 
 
 def fmt_len(mm, cfg):
@@ -1943,7 +1944,7 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST" and self.headers.get("X-ZombiePlot") != "1":
                 # Browsers cannot add this header on requests from other websites.
                 return self._fail("Blocked: this request did not come from the zombiePlot page.", 403)
-            public = path in ("/", "/index.html", "/thing", "/manifest.json", "/icon.svg", "/api/login")
+            public = path in ("/", "/index.html", "/thing", "/manifest.json", "/icon.svg", "/favicon.ico", "/api/login")
             local_status = path == "/api/status" and self.client_address[0] in ("127.0.0.1", "::1")
             if not (public or local_status or app.auth.ok(self.headers.get("Cookie"))):
                 return self._fail("Enter the PIN to use this page.", 401, auth=True)
@@ -1954,7 +1955,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, THING.encode("utf-8"), "text/html; charset=utf-8")
                 if path == "/manifest.json":
                     return self._send(200, MANIFEST.encode("utf-8"), "application/manifest+json")
-                if path == "/icon.svg":
+                if path in ("/icon.svg", "/favicon.ico"):
                     return self._send(200, ICON.encode("utf-8"), "image/svg+xml")
                 if path == "/api/status":
                     return self._json(app.status())
@@ -2171,6 +2172,8 @@ h2{font-size:15px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)
     <div class="seglbl">Where on the vinyl</div>
     <div class="seg"><button id="plc-auto" aria-pressed="true">Next free spot</button><button id="plc-origin" aria-pressed="false">At the start point</button></div>
   </div>
+  <div class="seglbl">Start jobs from</div>
+  <div class="seg"><button id="crn-origin" aria-pressed="true">Left edge</button><button id="crn-far" aria-pressed="false">Right edge</button></div>
   <div id="prog" hidden><div id="bar"></div></div>
   <div id="jobmsg" class="note"></div>
   <div class="cutrow">
@@ -2209,11 +2212,15 @@ h2{font-size:15px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)
 
   <h2>Plotter</h2>
   <label class="f"><span id="l-width">Widest the plotter can cut</span><input id="s-width" inputmode="decimal"></label>
-  <p class="note">Load scrap vinyl and cut the test square. Standing in front of the plotter it should be a 2 inch square with a normal, upright F in it. If the F is mirrored or lying on its side, change these and cut it again.</p>
+  <p class="note">Load scrap vinyl and cut the test square: the zombiePlot logo, a 2 inch square with "zP" inside. Standing in front of the plotter the P should read normally. If it is backwards, upside down or lying on its side, change these and cut it again.</p>
   <label class="c"><input type="checkbox" id="s-swap">Swap the two axes</label>
   <label class="c"><input type="checkbox" id="s-mc">Mirror left to right</label>
   <label class="c"><input type="checkbox" id="s-mf">Mirror front to back</label>
   <button id="test" class="wide" style="margin-top:10px">Cut test square</button>
+
+  <h2>Car Thing</h2>
+  <label class="f">Screen goes dark when idle for<select id="s-tsleep"><option value="0">Never</option><option value="1">1 minute</option><option value="2">2 minutes</option><option value="5">5 minutes</option><option value="10">10 minutes</option><option value="30">30 minutes</option></select></label>
+  <p class="note">Any dial turn or button press wakes it, and that first touch only wakes it. It also wakes when a cut starts or finishes.</p>
 
   <h2>Connection</h2>
   <label class="f">Cable type<select id="s-link"><option value="auto">Find it automatically</option><option value="parallel">Parallel (USB-to-parallel cable)</option><option value="serial">Serial (USB-to-serial cable)</option></select></label>
@@ -2331,6 +2338,8 @@ async function refreshPreview(){
                         "&copies=" + S.copies + "&layout=" + S.layout + "&place=" + S.place);
     if(seq !== pvSeq) return;
     S.pv = p; S.rot = p.rot;
+    $("crn-origin").setAttribute("aria-pressed", !p.far);
+    $("crn-far").setAttribute("aria-pressed", !!p.far);
     $("fname").textContent = p.name.replace(/\.svg$/i,"");
     $("plcrow").hidden = p.used.length === 0;
     draw(p);
@@ -2420,7 +2429,7 @@ function paint(){
     else if(job.state === "stopped" || job.state === "error") m = job.message;
   }
   if(S.view === "job") $("jobmsg").textContent = m;
-  for(const id of ["rot","mir","minus","plus","test","save","vnew","vundo","vwidth","lay-across","lay-stacked","plc-auto","plc-origin"]) $(id).disabled = !!sending;
+  for(const id of ["rot","mir","minus","plus","test","save","vnew","vundo","vwidth","lay-across","lay-stacked","plc-auto","plc-origin","crn-origin","crn-far"]) $(id).disabled = !!sending;
   if(sending && S.view === "set"){ $("up-install").disabled = true; $("up-back").disabled = true; }
 }
 
@@ -2465,6 +2474,7 @@ async function loadSettings(){
   $("l-vw").textContent = "Usable vinyl width (" + s.units + ")";
   $("s-width").value = +(s.cut_width_mm / u).toFixed(d); $("s-gap").value = +(s.copy_gap_mm / u).toFixed(d);
   $("s-vw").value = +(s.vinyl_width_mm / u).toFixed(d); $("s-corner").value = s.start_corner;
+  $("s-tsleep").value = String(s.thing_sleep_min);
   $("s-units").value = s.units; $("s-end").value = s.end_action; $("s-over").value = s.overcut_mm;
   $("s-swap").checked = s.swap_axes; $("s-mc").checked = s.mirror_carriage; $("s-mf").checked = s.mirror_feed;
   $("s-link").value = s.link; $("s-flow").value = s.flow; $("s-baud").value = s.baud; $("s-port").value = s.port;
@@ -2479,7 +2489,7 @@ async function saveSettings(){
   const u = S.settings.units === "mm" ? 1 : 25.4;
   const body = {
     cut_width_mm: parseFloat($("s-width").value) * u, copy_gap_mm: parseFloat($("s-gap").value) * u,
-    vinyl_width_mm: parseFloat($("s-vw").value) * u, start_corner: $("s-corner").value,
+    vinyl_width_mm: parseFloat($("s-vw").value) * u, start_corner: $("s-corner").value, thing_sleep_min: parseInt($("s-tsleep").value, 10),
     units: $("s-units").value, end_action: $("s-end").value, overcut_mm: parseFloat($("s-over").value),
     swap_axes: $("s-swap").checked, mirror_carriage: $("s-mc").checked, mirror_feed: $("s-mf").checked,
     link: $("s-link").value, flow: $("s-flow").value, baud: parseInt($("s-baud").value, 10),
@@ -2579,6 +2589,12 @@ $("plus").onclick = () => { if(S.copies < 500){ S.copies++; refreshPreview(); } 
 $("lay-across").onclick = () => { S.layout = "across"; refreshPreview(); };
 $("lay-stacked").onclick = () => { S.layout = "stacked"; refreshPreview(); };
 $("plc-auto").onclick = () => { S.place = "auto"; refreshPreview(); };
+async function setCorner(c){
+  try { await post("/api/settings", {start_corner: c}); if(S.settings) S.settings.start_corner = c; refreshPreview(); }
+  catch(e){ $("warns").innerHTML = '<div class="msg bad">' + esc(e.message) + "</div>"; }
+}
+$("crn-origin").onclick = () => setCorner("origin");
+$("crn-far").onclick = () => setCorner("far");
 $("plc-origin").onclick = () => { S.place = "origin"; refreshPreview(); };
 $("cut").onclick = doCut;
 $("stop").onclick = async () => { disarm(); try { await post("/api/stop"); } catch(e){ $("jobmsg").textContent = e.message; } poll(); };
@@ -2884,6 +2900,7 @@ background:var(--panel);border:2px solid transparent}
 #toast{position:absolute;left:20px;right:20px;bottom:16px;padding:14px 18px;border-radius:10px;background:var(--panel);
 border-left:5px solid var(--bad);font-size:19px;box-shadow:0 6px 24px rgba(0,0,0,.5)}
 #toast.ok{border-left-color:var(--ok)}
+#sleep{position:absolute;left:0;top:0;right:0;bottom:0;background:#000;z-index:50}
 </style>
 </head>
 <body>
@@ -2920,6 +2937,7 @@ border-left:5px solid var(--bad);font-size:19px;box-shadow:0 6px 24px rgba(0,0,0
   </section>
 </main>
 <div id="toast" hidden></div>
+<div id="sleep" hidden></div>
 <script>
 "use strict";
 var $ = function(id){ return document.getElementById(id); };
@@ -3093,7 +3111,8 @@ function keyMap(){
      run:function(){ twice("vnew", async function(){ try { await post("/api/session/new"); toast("New vinyl: earlier cuts forgotten.", true); } catch(e){ toast(e.message); } poll(); }); }},
     {label:armed("vundo") ? "Press again" : "Undo last", armed:armed("vundo"), off:busy || !(v && v.jobs),
      run:function(){ twice("vundo", async function(){ try { await post("/api/session/undo"); toast("Last job's area forgotten.", true); } catch(e){ toast(e.message); } poll(); }); }},
-    null];
+    {label:"From " + (v && v.start_corner === "far" ? "right edge" : "left edge"), on:!!(v && v.start_corner === "far"), off:busy || !v,
+     run:async function(){ try { await post("/api/settings", {start_corner: v.start_corner === "far" ? "origin" : "far"}); } catch(e){ toast(e.message); } poll(); }}];
   if(S.view === "job") return [
     {label:"Rotate " + (S.rot === "auto" ? 0 : S.rot) + "°", off:busy,
      run:function(){ S.rot = ((S.rot === "auto" ? 0 : S.rot) + 90) % 360; refreshPreview(); }},
@@ -3153,7 +3172,30 @@ async function poll(){
   var jobs = S.status && S.status.vinyl ? S.status.vinyl.jobs : -1;
   if(jobs !== S.vjobs){ var first = S.vjobs === -1; S.vjobs = jobs; if(!first && S.view === "job") refreshPreview(); }
   paint();
+  sleepCheck();
 }
+
+/* ---------- screen sleep: black after the idle time set in Settings (the backlight stays on) ---------- */
+var lastInput = Date.now(), asleep = false, lastJob = null;
+function wake(){
+  lastInput = Date.now();
+  if(!asleep) return false;
+  asleep = false; $("sleep").hidden = true;
+  return true;
+}
+function sleepCheck(){
+  var st = S.status, j = st && st.job, js = j ? j.state + "|" + j.name + "|" + j.total : "";
+  if(lastJob !== null && js !== lastJob) wake();          /* a cut started or finished: show it */
+  lastJob = js;
+  var mins = st ? +st.thing_sleep_min : 0;
+  if(!asleep && mins > 0 && !sending() && S.view !== "login" && Date.now() - lastInput > mins * 60000){
+    asleep = true; $("sleep").hidden = false;
+  }
+}
+["keydown", "click", "touchstart", "mousedown"].forEach(function(t){
+  window.addEventListener(t, function(e){ if(wake()){ e.preventDefault(); e.stopImmediatePropagation(); } }, true);
+});
+window.addEventListener("wheel", function(e){ if(wake()){ e.preventDefault(); e.stopImmediatePropagation(); } }, {capture:true, passive:false});
 
 /* ---------- PIN ---------- */
 function showLogin(){
