@@ -1,1 +1,1 @@
-{"version": "2.1.1", "ref": "33122e3a8168cc4021619f058b8140d61255dd53", "notes": "Clearer wording for sheet memory and At the knife; the page says when the start point moves."}
+{"version": "2.2", "ref": "a4b82be3275451e8a04fd3868e3429e34ba110f2", "notes": "Plotter tests in Settings: see what the plotter reports, and a knife-up motion test."}
