@@ -39,6 +39,20 @@ class FakeRoland(threading.Thread):
         self.oe = 0
         self.got_abort = 0
         self.queries = []
+        self.pos = (0, 0)               # knife position, plotter units
+
+    def jog(self, x, y):
+        """Arrow keys on the panel."""
+        with self.lock:
+            self.pos = (self.pos[0] + x, self.pos[1] + y)
+
+    def origin_here(self):
+        """The ORIGIN key: the knife becomes 0,0 and the cutting area moves by the same amount."""
+        with self.lock:
+            c = [int(v) for v in self.clip.split(",")]
+            x, y = self.pos
+            self.clip = "%d,%d,%d,%d" % (c[0] - x, c[1] - y, c[2] - x, c[3] - y)
+            self.pos = (0, 0)
 
     def reply(self, s):
         if not self.silent:
@@ -70,7 +84,7 @@ class FakeRoland(threading.Thread):
                 chunk = chunk[:room]
             self.buf += chunk
             self.max_fill = max(self.max_fill, len(self.buf))
-            if len(re.findall(rb"O[IHE];", bytes(self.buf))) > 1:
+            if len(re.findall(rb"O[IHEA];", bytes(self.buf))) > 1:
                 self.overlap += 1
 
     def work(self, n):
@@ -87,6 +101,8 @@ class FakeRoland(threading.Thread):
                 self.reply(self.clip)
             elif cmd == b"OE;":
                 self.reply(str(self.oe))
+            elif cmd == b"OA;":
+                self.reply("%d,%d,0" % self.pos)
             else:
                 self.cut += cmd
 
@@ -244,6 +260,69 @@ try:
         plotter.buf.clear()
     st = wait(lambda s: s["port"]["state"] == "connected", 15)
     check("plotter back on: ready again", st["port"]["state"] == "connected" and st["port"]["answers"], st["port"])
+
+    # --- the real PNC-1210's numbers: swapped axes, Y across ---
+    plotter.clip = "-6600,0,993320,11568"
+    st = wait(lambda s: abs(s["vinyl"]["width_mm"] - 289.2) < 0.01)
+    check("PNC-1210 cutting area reads 289.2 mm across", abs(st["vinyl"]["width_mm"] - 289.2) < 0.01, st["vinyl"])
+    api("/api/session/new", {})
+    c, j = api("/api/cut", {"id": ids["decal.svg"], "rot": 0, "mirror": False, "copies": 1, "place": "origin"})
+    wait(lambda s: s["job"]["state"] != "sending")
+
+    # --- At the knife ---
+    plotter.jog(2047, 2653)                          # the move made on the real plotter
+    c, pv = api("/api/preview?id=%s&rot=0&mirror=0&copies=1&place=knife&reread=1" % ids["decal.svg"])
+    check("knife read and used", pv["place"] == "knife" and pv["knife"] and abs(pv["knife"][0] - 66.325) < 0.01
+          and abs(pv["knife"][1] - 51.175) < 0.01, (pv["place"], pv.get("knife"), pv["warnings"]))
+    check("job's corner at the knife", abs(pv["base"][0] - 66.325) < 0.01 and abs(pv["base"][1] - 51.175) < 0.01, pv["base"])
+    with plotter.lock:
+        plotter.cut.clear()
+    c, j = api("/api/cut", {"id": ids["decal.svg"], "rot": 0, "mirror": False, "copies": 1, "place": "knife"})
+    wait(lambda s: s["job"]["state"] != "sending")
+    pts = [tuple(map(int, m)) for m in re.findall(rb"P[UD](-?\d+),(-?\d+)", bytes(plotter.cut))]
+    body = pts[:-1]                                  # the last move parks the knife
+    check("cut lands at the knife", c == 200 and min(p[0] for p in body) == 2047 and min(p[1] for p in body) == 2653,
+          (c, pts[:3]))
+    items = status()["vinyl"]
+    sess = app.session.snapshot()["items"]
+    check("sheet memory has the knife job", len(sess) == 2 and abs(sess[1]["x"] - 66.325) < 0.01 and abs(sess[1]["y"] - 51.175) < 0.01, sess)
+
+    # --- ORIGIN pressed on the plotter: width and sheet memory follow ---
+    plotter.pos = (2047, 2653)
+    plotter.origin_here()
+    st = wait(lambda s: abs(s["vinyl"]["width_mm"] - 222.88) < 0.01)
+    check("width after ORIGIN is from the new start point", abs(st["vinyl"]["width_mm"] - 222.88) < 0.01, st["vinyl"])
+    sess = app.session.snapshot()["items"]
+    check("sheet memory moved with the start point", len(sess) == 1 and abs(sess[0]["x"]) < 0.01 and abs(sess[0]["y"]) < 0.01, sess)
+    c, pv = api("/api/preview?id=%s&rot=0&mirror=0&copies=1&place=auto" % ids["decal.svg"])
+    check("next free spot avoids the job now at the start point", pv["base"][1] > 50 or pv["base"][0] > 100, pv["base"])
+
+    # --- knife too far across / behind ---
+    plotter.pos = (0, 8000)                          # 200 mm across: a 101.6 mm job runs off the 222.9 mm edge
+    c, pv = api("/api/preview?id=%s&rot=0&mirror=0&copies=1&place=knife&reread=1" % ids["decal.svg"])
+    check("knife near the edge: too wide, blocked", pv["fits"] is False and "past the edge" in pv["warnings"][0], pv["warnings"])
+    plotter.pos = (0, -400)
+    c, pv = api("/api/preview?id=%s&rot=0&mirror=0&copies=1&place=knife&reread=1" % ids["decal.svg"])
+    check("knife behind the start point: blocked", pv["fits"] is False and any("behind the start point" in w for w in pv["warnings"]), pv["warnings"])
+    c, j = api("/api/cut", {"id": ids["decal.svg"], "rot": 0, "mirror": False, "copies": 1, "place": "knife"})
+    check("and the cut is refused, with the reason", c == 400 and "behind the start point" in j["error"], j)
+
+    # --- knife can't be read: falls back for the preview, refuses the cut ---
+    plotter.paused = True
+    plotter.pos = (0, 0)
+    c, pv = api("/api/preview?id=%s&rot=0&mirror=0&copies=1&place=knife&reread=1" % ids["decal.svg"])
+    check("unreadable knife: preview says so and uses the next free spot", pv["place"] == "auto" and "knife position" in pv["warnings"][0], pv["warnings"])
+    c, j = api("/api/cut", {"id": ids["decal.svg"], "rot": 0, "mirror": False, "copies": 1, "place": "knife"})
+    check("unreadable knife: cut refused, nothing cut at another spot", c == 400 and "knife" in j["error"], j)
+    plotter.paused = False
+    time.sleep(1.5)
+
+    # --- power cycle: start point back where it was, sheet memory back too ---
+    plotter.clip = "-6600,0,993320,11568"
+    st = wait(lambda s: abs(s["vinyl"]["width_mm"] - 289.2) < 0.01)
+    sess = app.session.snapshot()["items"]
+    check("start point back: sheet memory back", len(sess) == 1 and abs(sess[0]["x"] - 66.325) < 0.01 and abs(sess[0]["y"] - 51.175) < 0.01, sess)
+
     check("still never an overlap", plotter.overlap == 0, plotter.overlap)
     check("never overflowed", plotter.overflow == 0, plotter.overflow)
 finally:

@@ -40,7 +40,7 @@ except ImportError:       # Windows: only --car-thing-install is meant to run th
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "2.0"
+VERSION = "2.1"
 UNITS_PER_MM = 40.0          # CAMM-GL III step = 0.025 mm
 FLATTEN_TOL_MM = 0.03        # curve-to-line tolerance (about one cutter step)
 MAX_UPLOAD = 25 * 1024 * 1024
@@ -937,6 +937,10 @@ def _p_clip(s):
     return tuple(int(v) for v in s.split(",")) if re.fullmatch(r"-?\d+,-?\d+,-?\d+,-?\d+", s) else None
 
 
+def _p_pos(s):
+    return tuple(int(v) for v in s.split(",")[:2]) if re.fullmatch(r"-?\d+,-?\d+(,\d+)?", s) else None
+
+
 def _p_text(s):
     s = s.strip()
     return s[:40] if s and all(32 <= ord(c) < 127 for c in s) else None
@@ -1149,15 +1153,17 @@ class Port:
                     return line.decode("ascii", "replace")
                 continue
             left = end - time.monotonic()
-            if left <= 0:
-                return None
-            r, _, _ = select.select([fd], [], [], min(left, 0.1))
+            r, _, _ = select.select([fd], [], [], max(0.0, min(left, 0.1)))
             if r:
                 try:
                     chunk = os.read(fd, 256)
                 except BlockingIOError:
                     chunk = b""
                 self.rx = (self.rx + chunk.replace(b"\x11", b"").replace(b"\x13", b""))[-4096:]
+                if chunk:
+                    continue
+            if left <= 0:
+                return None
 
     def _late(self, line):
         """A line nobody was waiting for: the answer to a query that timed out earlier."""
@@ -1216,14 +1222,50 @@ class Port:
         return self.pending is None
 
     def width_mm(self):
-        """Cutting width the plotter reports (its hard-clip limits across the vinyl), or None."""
+        """Width the plotter can cut across the vinyl, from its start point to the far edge of its
+        cutting area (its hard-clip limits), or None. Jobs only run from the start point onward,
+        so after ORIGIN is pressed partway across, the part behind it does not count."""
         c = self.talk["clip"]
         if not c:
             return None
         upm = self.cfg.get("steps_per_mm") or UNITS_PER_MM
-        w = abs(c[3] - c[1]) if self.cfg.get("swap_axes") else abs(c[2] - c[0])
-        w /= upm
+        lo, hi = (c[1], c[3]) if self.cfg.get("swap_axes") else (c[0], c[2])
+        w = (max(lo, hi) - max(0, min(lo, hi))) / upm
         return round(w, 2) if 20 <= w <= 3000 else None
+
+    def to_vinyl(self, x, y):
+        """Plotter units -> (across, along) in mm from the start point."""
+        upm = self.cfg.get("steps_per_mm") or UNITS_PER_MM
+        a, b = (y, x) if self.cfg.get("swap_axes") else (x, y)
+        return a / upm, b / upm
+
+    def knife(self):
+        """Where the knife is now, (across, along) in mm from the start point, read from the plotter."""
+        if not self.qlock.acquire(timeout=3):
+            raise PortError("The plotter is busy. Try again when the cut has finished.")
+        try:
+            with self.lock:
+                fd = self._open()
+                if self.is_parallel():
+                    raise PortError("Reading the knife position needs a serial cable. A parallel cable only sends.")
+            if not self.talk["ever"]:
+                raise PortError("The plotter is not answering zombiePlot, so the knife position cannot be read. "
+                                "Tap the status light for details.")
+            self._pending_settled(fd, 0.5)
+            if self.pending:
+                raise PortError("The plotter has not answered an earlier question yet. Check it is online "
+                                "(not paused or in a menu), then try again.")
+            v = self._ask(fd, b"OA;", _p_pos, 2.0, hpgl=True)
+            if v is None:
+                raise PortError("The plotter did not report the knife position. Check it is online "
+                                "(not paused or in a menu), then try again.")
+            return self.to_vinyl(*v)
+        except OSError as e:
+            with self.lock:
+                self._close()
+            raise PortError("Lost the plotter cable (%s)." % e.strerror)
+        finally:
+            self.qlock.release()
 
     def watch(self):
         """Ask an idle serial plotter about itself. Called every couple of seconds; it paces itself."""
@@ -1590,19 +1632,43 @@ class Session:
         self.lock = threading.Lock()
         self.items = []
         self.group = 0
+        self.clip = None          # the plotter's cutting area last seen, to notice ORIGIN being pressed
         try:
             with open(path, "r", encoding="utf-8") as f:
                 d = json.load(f)
             self.items = [i for i in d.get("items", []) if all(k in i for k in ("x", "y", "w", "h"))]
             self.group = int(d.get("group", 0))
+            c = d.get("clip")
+            self.clip = [int(v) for v in c] if isinstance(c, list) and len(c) == 4 else None
         except (OSError, ValueError, TypeError, AttributeError):
             pass
 
     def _save(self):
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"items": self.items, "group": self.group}, f)
+            json.dump({"items": self.items, "group": self.group, "clip": self.clip}, f)
         os.replace(tmp, self.path)
+
+    def follow(self, clip, to_vinyl):
+        """The plotter reported its cutting area. If it is the same size but has moved, the start
+        point was moved (ORIGIN pressed, or the plotter switched off and on): move the remembered
+        areas with it, so they stay where they are on the vinyl. Returns True if it moved."""
+        clip = [int(v) for v in clip]
+        with self.lock:
+            old, moved = self.clip, False
+            if old == clip:
+                return False
+            if old and (old[2] - old[0], old[3] - old[1]) == (clip[2] - clip[0], clip[3] - clip[1]):
+                da, db = to_vinyl(old[0] - clip[0], old[1] - clip[1])
+                for i in self.items:
+                    i["x"] -= da
+                    i["y"] -= db
+                # forget areas now wholly behind the start point: nothing can be cut there
+                self.items = [i for i in self.items if i["x"] + i["w"] > 0 and i["y"] + i["h"] > 0]
+                moved = True
+            self.clip = clip
+            self._save()
+            return moved
 
     def rects(self):
         with self.lock:
@@ -1654,6 +1720,7 @@ class App:
         self.cache = {}
         self.cache_lock = threading.Lock()
         self.applied_width = None          # last width taken from the plotter
+        self.knife_at = None               # (across, along) last read from the plotter, for "At the knife"
 
     def start_watch(self):
         threading.Thread(target=self._watch, daemon=True).start()
@@ -1664,9 +1731,15 @@ class App:
             try:
                 if not self.jobs.busy():
                     self.port.watch()
+                self.follow_origin()
                 self.take_width()
             except Exception as e:          # the watcher must keep running
                 sys.stderr.write("zombiePlot: plotter watch: %s\n" % e)
+
+    def follow_origin(self):
+        c = self.port.talk["clip"]
+        if c and self.session.follow(c, self.port.to_vinyl):
+            self.knife_at = None           # measured from the old start point
 
     def take_width(self):
         """Use the width the plotter reports, each time it reports a new one (new vinyl loaded)."""
@@ -1816,7 +1889,9 @@ class App:
             copies = 1
         mirror = str(q.get("mirror", "0")).lower() in ("1", "true")
         layout = "stacked" if q.get("layout") == "stacked" else "across"
-        place = "origin" if q.get("place") == "origin" or setup else "auto"
+        place = q.get("place") if q.get("place") in ("origin", "knife") else "auto"
+        if setup:
+            place = "origin"
         rot = q.get("rot", 0)
         cut_w = cfg["cut_width_mm"]
         vinyl_w = min(cfg["vinyl_width_mm"], cut_w)
@@ -1837,16 +1912,42 @@ class App:
         polys, w, h = orient(polys, rot, mirror)
         cols, rows, offsets, job_w, job_h = grid(w, h, copies, vinyl_w, gap, layout)
         fits = job_w <= vinyl_w + 0.01
+        block = ""                          # why it cannot be cut, when it cannot
         if not fits:
             limit = "vinyl width" if vinyl_w < cut_w - 0.01 else "cutting width"
-            warnings.insert(0, "Too wide: %s across, the %s is %s. Rotate it, stack the copies, "
-                               "or change the vinyl width."
-                            % (fmt_len(job_w, cfg), limit, fmt_len(vinyl_w, cfg)))
+            block = ("Too wide: %s across, the %s is %s. Rotate it, stack the copies, "
+                     "or change the vinyl width." % (fmt_len(job_w, cfg), limit, fmt_len(vinyl_w, cfg)))
+            warnings.insert(0, block)
 
         # Where on the vinyl. Work from the chosen edge, store from the plotter's origin.
         used = [] if setup else self.session.rects()
         used_c = [mirror_x(r, vinyl_w) for r in used] if far else used
-        if place == "auto" and used:
+        knife = None
+        if place == "knife":
+            try:
+                if q.get("reread") or self.knife_at is None:
+                    self.knife_at = self.port.knife()
+                knife = self.knife_at
+            except PortError as e:
+                self.knife_at = None
+                block = "Could not read the knife position: %s" % e
+                warnings.insert(0, block + " Placed at the next free spot instead.")
+                place = "auto"
+        if knife:
+            ka, kb = knife
+            cx = vinyl_w - ka - job_w if far else ka      # cx, cy are measured from the chosen edge
+            cy = kb
+            if ka < -0.05 or kb < -0.05:
+                fits = False
+                block = ("The knife is behind the start point. Move it onto the vinyl past the "
+                         "start point, then tap At the knife again.")
+                warnings.insert(0, block)
+            elif fits and ka + job_w > vinyl_w + 0.01:
+                fits = False
+                block = ("From the knife the job runs %s past the edge. Move the knife back "
+                         "toward the start point, then tap At the knife again." % fmt_len(ka + job_w - vinyl_w, cfg))
+                warnings.insert(0, block)
+        elif place == "auto" and used:
             cx, cy = find_spot(used_c, job_w, job_h, vinyl_w, gap)
         else:
             cx, cy = 0.0, 0.0
@@ -1869,7 +1970,7 @@ class App:
                 "mirror": mirror, "copies": copies, "cols": cols, "rows": rows, "layout": layout,
                 "offsets": offsets, "job_w": job_w, "job_h": job_h, "fits": fits,
                 "warnings": warnings, "note": note, "place": place, "base": (bx, by),
-                "rects": rects, "clash": bool(clash), "vinyl_w": vinyl_w, "far": far,
+                "rects": rects, "clash": bool(clash), "vinyl_w": vinyl_w, "far": far, "block": block,
                 "park": park, "setup": setup}
 
     def preview(self, q):
@@ -1881,6 +1982,7 @@ class App:
                 "fits": p["fits"], "warnings": p["warnings"], "note": p["note"],
                 "cut_width": p["cfg"]["cut_width_mm"], "vinyl_width": p["vinyl_w"], "far": p["far"],
                 "place": p["place"], "base": p["base"], "clash": p["clash"], "rects": p["rects"],
+                "knife": self.knife_at if p["place"] == "knife" else None,
                 "origin_side": origin_side(p["cfg"]), "origin_row": origin_row(p["cfg"]),
                 "used": self.session.snapshot()["items"],
                 "shapes": len(p["polys"]) * p["copies"],
@@ -1891,8 +1993,8 @@ class App:
         if self.jobs.busy():
             raise UserError("A job is already running.")
         p = self.plan(q)
-        if not p["fits"]:
-            raise UserError(p["warnings"][0])
+        if (q.get("place") == "knife" and p["place"] != "knife") or not p["fits"]:
+            raise UserError(p["block"] or p["warnings"][0])
         st = self.port.status()
         if st["state"] == "missing":
             raise UserError(st["message"])
@@ -1904,6 +2006,7 @@ class App:
             raise UserError(str(e))
         if not p["setup"]:
             self.session.add(p["rects"], p["name"])
+        self.knife_at = None               # the knife moves during the cut: read it again next time
         return {"bytes": len(data), "seconds": len(data) * 10.0 / p["cfg"]["baud"]}
 
     def update_info(self):
@@ -2555,8 +2658,8 @@ h2{font-size:15px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)
 #stage .jobbox{fill:none;stroke:var(--go);stroke-width:1.5;stroke-dasharray:6 4;vector-effect:non-scaling-stroke}
 #stage.clash .jobbox{stroke:var(--bad)}
 #stage .lbl{fill:var(--dim);font-family:system-ui,sans-serif}
-.seg{display:grid;grid-template-columns:1fr 1fr;gap:0;margin:10px 0;border:1px solid var(--line);border-radius:10px;overflow:hidden}
-.seg button{border:0;border-radius:0;min-height:46px;font-size:15px}
+.seg{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;gap:0;margin:10px 0;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.seg button{border:0;border-radius:0;min-height:46px;font-size:15px}.seg button[hidden]{display:none}
 .seg button+button{border-left:1px solid var(--line)}
 .seg button[aria-pressed=true]{background:var(--go);color:var(--go-text)}
 .seglbl{font-size:13px;color:var(--dim);margin:12px 2px -4px}
@@ -2632,7 +2735,7 @@ details{margin:14px 2px}summary{cursor:pointer;color:var(--dim);font-size:14px}
   </div>
   <div id="plcrow" hidden>
     <div class="seglbl">Where on the vinyl</div>
-    <div class="seg"><button id="plc-auto" aria-pressed="true">Next free spot</button><button id="plc-origin" aria-pressed="false">At the start point</button></div>
+    <div class="seg"><button id="plc-auto" aria-pressed="true">Next free spot</button><button id="plc-origin" aria-pressed="false">At the start point</button><button id="plc-knife" aria-pressed="false">At the knife</button></div>
   </div>
   <div class="seglbl">Start jobs from</div>
   <div class="seg"><button id="crn-left" aria-pressed="true">Left edge</button><button id="crn-right" aria-pressed="false">Right edge</button></div>
@@ -2824,17 +2927,22 @@ async function refreshPreview(){
   $("lay-stacked").setAttribute("aria-pressed", S.layout === "stacked");
   $("plc-auto").setAttribute("aria-pressed", S.place === "auto");
   $("plc-origin").setAttribute("aria-pressed", S.place === "origin");
+  $("plc-knife").setAttribute("aria-pressed", S.place === "knife");
   $("layrow").hidden = S.copies < 2;
+  const reread = S.reread ? "&reread=1" : ""; S.reread = false;
   try{
     const p = await api("/api/preview?id=" + encodeURIComponent(S.id) + "&rot=" + S.rot + "&mirror=" + (S.mirror?1:0) +
-                        "&copies=" + S.copies + "&layout=" + S.layout + "&place=" + S.place);
+                        "&copies=" + S.copies + "&layout=" + S.layout + "&place=" + S.place + reread);
     if(seq !== pvSeq) return;
     S.pv = p; S.rot = p.rot;
+    if(p.place !== S.place){ S.place = p.place; for(const k of ["auto","origin","knife"]) $("plc-" + k).setAttribute("aria-pressed", S.place === k); }
     const edge = startEdge(p.far, p.origin_side);
     $("crn-left").setAttribute("aria-pressed", edge === "left");
     $("crn-right").setAttribute("aria-pressed", edge === "right");
     $("fname").textContent = p.name.replace(/\.svg$/i,"");
-    $("plcrow").hidden = p.used.length === 0;
+    const talks = S.status && S.status.port && S.status.port.answers;
+    $("plcrow").hidden = p.used.length === 0 && !talks;
+    $("plc-knife").hidden = !talks;
     draw(p);
     let t = "<b>" + len(p.w) + " wide &times; " + len(p.h) + " long</b>" + (p.copies > 1 ? " each" : "");
     if(p.copies > 1){
@@ -2842,7 +2950,8 @@ async function refreshPreview(){
       t += "<br>All " + p.copies + ": <b>" + len(p.job_w) + " wide &times; " + len(p.job_h) + " long</b> (" + how + ")";
     }
     const along = p.base[1], across = p.far ? p.vinyl_width - p.base[0] - p.job_w : p.base[0];
-    const at = (along < 0.05 && across < 0.05) ? (p.far ? "At the right-hand corner" : "At the start point")
+    const at = p.place === "knife" && p.knife ? "Corner at the knife: " + len(p.knife[0]) + " across, " + len(p.knife[1]) + " along from the start point"
+             : (along < 0.05 && across < 0.05) ? (p.far ? "At the right-hand corner" : "At the start point")
              : "Placed " + len(across) + " across" + (p.far ? " from the right" : "") + ", " + len(along) + " along";
     t += "<br>" + at + " &middot; " + p.shapes + " shape" + (p.shapes === 1 ? "" : "s");
     $("dims").innerHTML = t;
@@ -2934,7 +3043,7 @@ function paint(){
     else if(job.state === "stopped" || job.state === "error") m = job.message;
   }
   if(S.view === "job") $("jobmsg").textContent = m;
-  for(const id of ["rot","mir","minus","plus","test","save","vnew","vundo","vwidth","lay-across","lay-stacked","plc-auto","plc-origin","crn-left","crn-right","del"]) $(id).disabled = !!sending;
+  for(const id of ["rot","mir","minus","plus","test","save","vnew","vundo","vwidth","lay-across","lay-stacked","plc-auto","plc-origin","plc-knife","crn-left","crn-right","del"]) $(id).disabled = !!sending;
   if(sending && S.view === "set"){ $("up-install").disabled = true; $("up-back").disabled = true; }
 }
 
@@ -2996,7 +3105,7 @@ async function loadSettings(){
   $("s-autow").checked = !!s.auto_width;
   const pw = S.status && S.status.port && S.status.port.width_mm;
   $("vw-note").textContent = pw
-    ? "The plotter reports " + len(pw) + " of cutting width. With the box ticked, zombiePlot uses that each time it changes (when you load new vinyl). A width you type is kept until then."
+    ? "The plotter reports " + len(pw) + " from its start point to the far edge. With the box ticked, zombiePlot uses that each time it changes (new vinyl, or ORIGIN pressed on the plotter). A width you type is kept until then."
     : "How far across the plotter can cut on the vinyl loaded now. Change it when you load a different width. A plotter on a two-way serial cable reports this itself.";
   $("s-tsleep").value = String(s.thing_sleep_min);
   $("s-units").value = s.units; $("s-end").value = s.end_action; $("s-over").value = s.overcut_mm;
@@ -3210,6 +3319,7 @@ $("del").onclick = async () => {
   } catch(e){ $("warns").innerHTML = '<div class="msg bad">' + esc(e.message) + "</div>"; }
 };
 $("plc-origin").onclick = () => { S.place = "origin"; refreshPreview(); };
+$("plc-knife").onclick = () => { S.place = "knife"; S.reread = true; refreshPreview(); };
 $("cut").onclick = doCut;
 $("stop").onclick = async () => { disarm(); try { await post("/api/stop"); } catch(e){ $("jobmsg").textContent = e.message; } poll(); };
 $("save").onclick = async () => { try { await saveSettings(); setMsg("Saved.", true); } catch(e){ setMsg(e.message, false); } };
@@ -3666,11 +3776,13 @@ async function refreshPreview(){
   if(armed("cut")) S.arm = null;
   paint();
   try{
+    var reread = S.reread ? "&reread=1" : ""; S.reread = false;
     var p = await api("/api/preview?id=" + encodeURIComponent(S.id) + "&rot=" + S.rot + "&mirror=" + (S.mirror ? 1 : 0) +
-                      "&copies=" + S.copies + "&layout=" + S.layout + "&place=" + S.place);
+                      "&copies=" + S.copies + "&layout=" + S.layout + "&place=" + S.place + reread);
     if(seq !== pvSeq) return;
     S.pv = p; S.rot = p.rot;
-    if(!p.used.length) S.place = "auto";
+    S.place = p.place;
+    if(!p.used.length && S.place === "origin") S.place = "auto";
     $("fname").textContent = bare(p.name);
     draw(p);
     var u = S.units === "mm" ? " mm" : " in";
@@ -3680,7 +3792,8 @@ async function refreshPreview(){
       t += "<br>All: <b>" + num(p.job_w) + " &times; " + num(p.job_h) + u + "</b> (" + how + ")";
     }
     var along = p.base[1], across = p.far ? p.vinyl_width - p.base[0] - p.job_w : p.base[0];
-    t += "<br>" + ((along < 0.05 && across < 0.05) ? (p.far ? "At the right-hand corner" : "At the start point")
+    t += "<br>" + (p.place === "knife" && p.knife ? "Corner at the knife: " + len(p.knife[0]) + " across, " + len(p.knife[1]) + " along"
+                 : (along < 0.05 && across < 0.05) ? (p.far ? "At the right-hand corner" : "At the start point")
                  : len(across) + " across" + (p.far ? " from the right" : "") + ", " + len(along) + " along");
     $("dims").innerHTML = t;
     var notes = p.warnings.map(function(w){ return '<div class="msg' + (p.fits && !(p.clash && w.indexOf("This spot") === 0) ? "" : " bad") + '">' + esc(w) + "</div>"; });
@@ -3717,6 +3830,7 @@ function draw(p){
     uses + '<circle class="org" cx="' + (right ? VW : 0) + '" cy="' + (back ? H : 0) + '" r="' + (Math.max(W, H) * 0.015) + '"/></g></svg>';
 }
 function sending(){ var j = S.status && S.status.job; return !!(j && (j.state === "sending" || j.state === "stopping")); }
+function talks(){ return !!(S.status && S.status.port && S.status.port.answers); }
 function setCopies(n){
   n = Math.max(1, Math.min(500, n));
   if(n === S.copies || sending()) return;
@@ -3755,8 +3869,13 @@ function keyMap(){
      run:function(){ S.mirror = !S.mirror; refreshPreview(); }},
     {label:S.layout === "stacked" ? "Stacked" : "Side by side", off:busy || S.copies < 2,
      run:function(){ S.layout = S.layout === "stacked" ? "across" : "stacked"; refreshPreview(); }},
-    {label:S.place === "origin" ? "Start point" : "Next free", on:S.place === "origin", off:busy || !(S.pv && S.pv.used.length),
-     run:function(){ S.place = S.place === "origin" ? "auto" : "origin"; refreshPreview(); }}];
+    {label:S.place === "origin" ? "Start point" : S.place === "knife" ? "At the knife" : "Next free", on:S.place !== "auto",
+     off:busy || !((S.pv && S.pv.used.length) || talks()),
+     run:function(){
+       var order = ["auto"].concat(S.pv && S.pv.used.length ? ["origin"] : []).concat(talks() ? ["knife"] : []);
+       S.place = order[(order.indexOf(S.place) + 1) % order.length];
+       if(S.place === "knife") S.reread = true;
+       refreshPreview(); }}];
   return [null, null, null, null];
 }
 function press(i){

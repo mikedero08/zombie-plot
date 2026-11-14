@@ -44,9 +44,11 @@ The cable has to appear on the Pi as a printer port (`/dev/usb/lp0`) or a serial
 
 Over a two-way serial cable the plotter answers zombiePlot, which gives you:
 
-- **The vinyl width**, read from the plotter. It is read again whenever it changes, for example when you load new vinyl.
+- **The vinyl width**, read from the plotter. This is the width from its start point to the far edge of its cutting area. It is read again whenever it changes, for example when you load new vinyl.
 - **Real cut progress and a real "done".** zombiePlot sends only what fits in the plotter's buffer, and asks after every block how much room is left. The percentage is what the plotter has actually cut, and the job finishes when the plotter has finished cutting.
 - **A confirmed stop.** After Stop, the plotter reports that its buffer is empty.
+- **At the knife.** Move the carriage with the plotter's arrow keys to where you want the job. On the job screen, tap **At the knife**, or step key 4 on the Car Thing to it. The corner of the job nearest the start point goes where the knife is. Tap it again after moving the knife.
+- **ORIGIN followed.** If you press ORIGIN on the plotter, zombiePlot sees the start point move. It moves its sheet memory to match, so earlier jobs stay where they are on the vinyl. It also measures the width from the new start point. The same happens when the plotter is switched off and on and its start point goes back.
 - **Plotter errors** reported after the cut, and the plotter's model number.
 
 A parallel cable only sends data, so with one the page shows what has been sent, not what has been cut.
