@@ -1,1 +1,1 @@
-{"version": "1.9", "ref": "ec53cd710740ab1d814cb424defb801754fbc9ee", "notes": "Picture-based Plotter setup: cut one test, tap the matching picture."}
+{"version": "2.0", "ref": "de00d1da654b403d6150d48ce2cca6c5c36d7db7", "notes": "Serial: vinyl width from the plotter, real cut progress and finish, confirmed stop, plotter errors."}
