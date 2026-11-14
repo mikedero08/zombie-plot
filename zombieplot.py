@@ -40,7 +40,7 @@ except ImportError:       # Windows: only --car-thing-install is meant to run th
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.9"
+VERSION = "2.0"
 UNITS_PER_MM = 40.0          # CAMM-GL III step = 0.025 mm
 FLATTEN_TOL_MM = 0.03        # curve-to-line tolerance (about one cutter step)
 MAX_UPLOAD = 25 * 1024 * 1024
@@ -58,6 +58,7 @@ DEFAULTS = {
     "flow": "hardware",        # hardware | xonxoff | none
     "cut_width_mm": 584.0,     # widest the plotter can cut (PNC-1210: 585 mm / 23 in)
     "vinyl_width_mm": 584.0,   # usable width of the vinyl loaded now
+    "auto_width": True,        # take the vinyl width from the plotter when it reports one (serial)
     "start_corner": "origin",  # origin | far: which edge of the vinyl jobs start from
     "copy_gap_mm": 5.0,
     "overcut_mm": 1.0,         # matches the 1 mm overcut set in Inkcut
@@ -124,6 +125,7 @@ VALIDATORS = {
     "flow": _choice("hardware", "xonxoff", "none"),
     "cut_width_mm": _num(20, 3000),
     "vinyl_width_mm": _num(20, 3000),
+    "auto_width": _bool,
     "start_corner": _choice("origin", "far"),
     "steps_per_mm": _num(1, 1000),
     "copy_gap_mm": _num(0, 500),
@@ -913,13 +915,48 @@ LP_PERRORP, LP_PSELECD, LP_POUTPA = 0x08, 0x10, 0x20
 PARALLEL_PATTERNS = ("/dev/usb/lp*", "/dev/lp[0-9]*")
 SERIAL_PATTERNS = ("/dev/serial/by-id/*", "/dev/ttyUSB*", "/dev/ttyACM*")
 
+# Two-way serial. Device-control queries (ESC.B) are answered at once; HP-GL output
+# instructions (OI, OH, OE) are answered when the plotter reaches them in its buffer, and a
+# second one sent before the first is answered makes a Roland show "Error 10: output request
+# overlap". So only one HP-GL query is ever outstanding.
+ESC_B = b"\x1b.B"           # free bytes in the plotter's buffer
+WATCH_EVERY = 10.0           # seconds between idle checks on a plotter that answers
+SILENT_RETRY = 60.0          # ... on a plotter that has never answered (one-way cable)
+LOST_RETRY = 5.0             # ... on one that answered before and has gone quiet
+PENDING_GIVE_UP = 90.0       # an HP-GL query unanswered this long is taken as lost
+HPGL_ERRORS = {1: "a command it does not recognise", 2: "a command with the wrong number of values",
+               3: "a value out of range", 5: "an unknown character set",
+               6: "a position outside its cutting area", 7: "its buffer overflowed"}
+
+
+def _p_int(s):
+    return int(s) if re.fullmatch(r"\d{1,9}", s) else None
+
+
+def _p_clip(s):
+    return tuple(int(v) for v in s.split(",")) if re.fullmatch(r"-?\d+,-?\d+,-?\d+,-?\d+", s) else None
+
+
+def _p_text(s):
+    s = s.strip()
+    return s[:40] if s and all(32 <= ord(c) < 127 for c in s) else None
+
 
 class Port:
     def __init__(self, cfg):
         self.cfg = cfg
         self.lock = threading.RLock()
+        self.qlock = threading.Lock()      # one conversation with the plotter at a time
         self.fd = None
         self.sig = None
+        self.rx = b""
+        self.pending = None                # (HP-GL query, time sent) not answered yet
+        self.talk = self._fresh_talk(None)
+
+    @staticmethod
+    def _fresh_talk(dev):
+        return {"dev": dev, "answers": None, "ever": False, "model": "", "clip": None,
+                "bufsize": 0, "next": 0.0}
 
     def device(self):
         p = self.cfg.get("port")
@@ -991,6 +1028,12 @@ class Port:
             except (termios.error, OSError) as e:
                 os.close(fd)
                 raise PortError("Cannot set up %s: %s" % (dev, e))
+            try:      # the plotter will not send its answers unless these are on
+                fcntl.ioctl(fd, termios.TIOCMBIS, struct.pack("I", termios.TIOCM_DTR | termios.TIOCM_RTS))
+            except OSError:
+                pass
+            if self.talk["dev"] != dev:
+                self.talk, self.pending, self.rx = self._fresh_talk(dev), None, b""
         self.fd, self.sig = fd, sig
         return fd
 
@@ -1042,7 +1085,10 @@ class Port:
                                                       "vinyl is loaded, and it is not in a menu.")
                         else:
                             state = "ready"
-                elif self.cfg.get("flow") == "hardware":
+                elif self.talk["ever"] and self.talk["answers"] is False:
+                    state, msg = "notready", ("The plotter has stopped answering. Check that it is switched on, "
+                                              "vinyl is loaded and it is not in a menu.")
+                elif self.cfg.get("flow") == "hardware" and not self.talk["answers"]:
                     cts = self._cts(fd)
                     if cts is False:
                         state, msg = "notready", ("The plotter is not signalling ready. Switch it on, load vinyl "
@@ -1050,8 +1096,11 @@ class Port:
                                                   "to None in Settings.")
                     else:
                         state = "ready"
-                return {"state": state, "device": self.sig[0], "message": msg,
-                        "link": "parallel" if self.is_parallel() else "serial"}
+                out = {"state": state, "device": self.sig[0], "message": msg,
+                       "link": "parallel" if self.is_parallel() else "serial"}
+                if not self.is_parallel():
+                    out.update(answers=self.talk["answers"], model=self.talk["model"], width_mm=self.width_mm())
+                return out
             except PortError as e:
                 return {"state": "missing", "device": None, "message": str(e), "link": None}
             except OSError as e:
@@ -1060,13 +1109,251 @@ class Port:
                         "message": "Plotter cable error: %s" % e.strerror}
 
     def send(self, data, stop, progress):
-        """Send data at the pace the plotter accepts it. progress(bytes_out, waiting)."""
+        """Send data at the pace the plotter accepts it. progress(bytes, waiting, tracked).
+
+        Returns {"tracked": True, "plotter_error": n} when the plotter reported on the cut
+        as it went (two-way serial), else {"tracked": False}."""
         with self.lock:
             self._open()
             par = self.is_parallel()
         if par:
-            return self._send_parallel(data, stop, progress)
-        return self._send_serial(data, stop, progress)
+            self._send_parallel(data, stop, progress)
+            return {"tracked": False}
+        with self.qlock:
+            with self.lock:
+                fd = self.fd
+            if fd is None:
+                raise PortError("The plotter cable was disconnected.")
+            try:
+                free = self._probe_for_job(fd)
+                if free is None:
+                    self._send_serial(data, stop, progress)
+                    return {"tracked": False}
+                return self._send_checked(fd, data, stop, progress, free)
+            except OSError as e:
+                with self.lock:
+                    self._close()
+                raise PortError("Lost the plotter cable (%s)." % e.strerror)
+
+    # ---- talking to a two-way serial plotter ----
+
+    def _read_line(self, fd, timeout):
+        """One answer line from the plotter, or None. XON/XOFF bytes are dropped."""
+        end = time.monotonic() + max(0.0, timeout)
+        while True:
+            m = re.search(rb"[\r\n]", self.rx)
+            if m:
+                line, self.rx = self.rx[:m.start()], self.rx[m.end():]
+                line = line.strip()
+                if line:
+                    return line.decode("ascii", "replace")
+                continue
+            left = end - time.monotonic()
+            if left <= 0:
+                return None
+            r, _, _ = select.select([fd], [], [], min(left, 0.1))
+            if r:
+                try:
+                    chunk = os.read(fd, 256)
+                except BlockingIOError:
+                    chunk = b""
+                self.rx = (self.rx + chunk.replace(b"\x11", b"").replace(b"\x13", b""))[-4096:]
+
+    def _late(self, line):
+        """A line nobody was waiting for: the answer to a query that timed out earlier."""
+        if self.pending:
+            cmd, self.pending = self.pending[0], None
+            self._apply(cmd, line)
+
+    def _catch_up(self, fd):
+        while True:
+            line = self._read_line(fd, 0)
+            if line is None:
+                return
+            self._late(line)
+
+    def _apply(self, cmd, line):
+        if cmd == b"OI;":
+            v = _p_text(line)
+            if v:
+                self.talk["model"] = v
+        elif cmd == b"OH;":
+            v = _p_clip(line)
+            if v:
+                self.talk["clip"] = v
+
+    def _ask(self, fd, cmd, parse, timeout, hpgl=False):
+        """Send one query and wait for its answer. Only one HP-GL query is ever outstanding."""
+        self._catch_up(fd)
+        if hpgl:
+            if self.pending:
+                return None
+            self.pending = (cmd, time.monotonic())
+        self._write_all(fd, cmd)
+        end = time.monotonic() + timeout
+        while True:
+            line = self._read_line(fd, end - time.monotonic())
+            if line is None:
+                return None
+            if hpgl:
+                self.pending = None
+                self._apply(cmd, line)
+                return parse(line)
+            v = parse(line)
+            if v is not None:
+                return v
+            self._late(line)
+
+    def _pending_settled(self, fd, wait=0.0):
+        """False while an earlier HP-GL query is still unanswered (and not yet given up on)."""
+        self._catch_up(fd)
+        if self.pending and wait:
+            line = self._read_line(fd, wait)
+            if line is not None:
+                self._late(line)
+        if self.pending and time.monotonic() - self.pending[1] > PENDING_GIVE_UP:
+            self.pending = None
+        return self.pending is None
+
+    def width_mm(self):
+        """Cutting width the plotter reports (its hard-clip limits across the vinyl), or None."""
+        c = self.talk["clip"]
+        if not c:
+            return None
+        upm = self.cfg.get("steps_per_mm") or UNITS_PER_MM
+        w = abs(c[3] - c[1]) if self.cfg.get("swap_axes") else abs(c[2] - c[0])
+        w /= upm
+        return round(w, 2) if 20 <= w <= 3000 else None
+
+    def watch(self):
+        """Ask an idle serial plotter about itself. Called every couple of seconds; it paces itself."""
+        if not self.qlock.acquire(blocking=False):
+            return
+        try:
+            t = self.talk
+            if time.monotonic() < t["next"]:
+                return
+            with self.lock:
+                try:
+                    fd = self._open()
+                except PortError:
+                    return
+                if self.is_parallel():
+                    return
+                t = self.talk
+            try:
+                self._pending_settled(fd)
+                if self.pending and self.pending[0] != b"OH;":
+                    # OI and OE answers are plain numbers, like the buffer answer: do not mix them up.
+                    t["next"] = time.monotonic() + 2.0
+                    return
+                free = self._ask(fd, ESC_B, _p_int, 1.5)
+                if free is None:
+                    t["answers"] = False
+                    t["next"] = time.monotonic() + (LOST_RETRY if t["ever"] else SILENT_RETRY)
+                    return
+                t["answers"], t["ever"] = True, True
+                t["bufsize"] = max(t["bufsize"], free)
+                if self.pending and free >= t["bufsize"]:
+                    self.pending = None        # its buffer is empty, so that query was lost (switched off)
+                if self.pending:
+                    t["next"] = time.monotonic() + 2.0      # still waiting in its buffer (paused, in a menu)
+                    return
+                if not t["model"]:
+                    self._ask(fd, b"OI;", _p_text, 2.0, hpgl=True)
+                    t["next"] = time.monotonic() + 1.0
+                else:
+                    self._ask(fd, b"OH;", _p_clip, 2.0, hpgl=True)
+                    t["next"] = time.monotonic() + WATCH_EVERY
+            except OSError:
+                with self.lock:
+                    self._close()
+        finally:
+            self.qlock.release()
+
+    def _probe_for_job(self, fd):
+        """Free buffer bytes if this plotter can report on the cut, else None."""
+        t = self.talk
+        if t["answers"] is False and not t["ever"]:
+            return None                    # one-way cable: do not hold every job up asking
+        self._pending_settled(fd, 0.5)
+        if self.pending and self.pending[0] != b"OH;":
+            return None                    # an old numeric answer could still arrive and be misread
+        free = self._ask(fd, ESC_B, _p_int, 1.5)
+        if free is None:
+            t["answers"] = False
+            return None
+        t["answers"], t["ever"] = True, True
+        return free
+
+    def _flow(self, fd, on):
+        """Kernel flow control on or off. Off while zombiePlot paces the data from the buffer reports."""
+        a = termios.tcgetattr(fd)
+        flow = self.cfg.get("flow")
+        a[0] = termios.IXON if (on and flow == "xonxoff") else 0
+        a[2] = (a[2] | termios.CRTSCTS) if (on and flow == "hardware") else (a[2] & ~termios.CRTSCTS)
+        termios.tcsetattr(fd, termios.TCSANOW, a)
+
+    def _drain_out(self, fd, stop, limit=15.0):
+        end = time.monotonic() + limit
+        while self._queued(fd):
+            if stop.is_set():
+                raise Cancelled()
+            if time.monotonic() > end:
+                raise PortError("The plotter cable stopped taking data.")
+            time.sleep(0.01)
+
+    def _send_checked(self, fd, data, stop, progress, free):
+        """Send only what fits in the plotter's buffer, asking it after every block how much it has
+        left. That gives real progress (what it has cut, not just what it was sent) and a real
+        finish (its buffer is empty)."""
+        t = self.talk
+        size = t["bufsize"] = max(t["bufsize"], free)
+        margin = max(16, min(256, size // 4))
+        total, sent, done = len(data), 0, 0
+        began = last_answer = changed = time.monotonic()
+        self._flow(fd, False)
+        try:
+            while True:
+                if stop.is_set():
+                    raise Cancelled()
+                room = free - margin
+                if sent < total and room >= min(64, total - sent):
+                    n = min(room, 512, total - sent)
+                    self._write_all(fd, data[sent:sent + n], 15.0)
+                    self._drain_out(fd, stop)
+                    sent += n
+                elif stop.wait(0.25):
+                    raise Cancelled()
+                f = self._ask(fd, ESC_B, _p_int, 1.5)
+                now = time.monotonic()
+                if f is None:
+                    if now - last_answer > 30:
+                        t["answers"] = False
+                        raise PortError("The plotter stopped answering during the cut. Check that it is "
+                                        "switched on. What it already has may still be cutting.")
+                    progress(done, True, True)
+                    continue
+                last_answer, free = now, f
+                if free > size:
+                    size = t["bufsize"] = free
+                held = size - free
+                if max(0, sent - held) != done:
+                    done, changed = max(0, sent - held), now
+                if sent >= total and held <= 0:
+                    break
+                if sent == 0 and now - began > 15:
+                    raise PortError("The plotter is not taking data: its buffer stays full. Check that it "
+                                    "is not paused or in a menu, and that vinyl is loaded.")
+                progress(min(done, total), held > 0 and now - changed > 20, True)
+            progress(total, False, True)
+            err = self._ask(fd, b"OE;", _p_int, 3.0, hpgl=True)
+            return {"tracked": True, "plotter_error": err or None}
+        finally:
+            try:
+                self._flow(fd, True)
+            except (termios.error, OSError):
+                pass
 
     def _send_parallel(self, data, stop, progress):
         # The usblp driver blocks writes while the plotter holds BUSY, so the
@@ -1151,7 +1438,16 @@ class Port:
                 time.sleep(0.02)
 
     def abort(self):
-        """Tell the cutter to drop everything it has buffered and lift the knife."""
+        """Tell the cutter to drop everything it has buffered and lift the knife.
+        Returns what to tell the user."""
+        got = self.qlock.acquire(timeout=5)
+        try:
+            return self._abort()
+        finally:
+            if got:
+                self.qlock.release()
+
+    def _abort(self):
         with self.lock:
             fd = self._open()
             try:
@@ -1161,7 +1457,7 @@ class Port:
                     except OSError:
                         raise PortError("The plotter's buffer is full, so it could not take the stop command. "
                                         "Switch the plotter off to stop it.")
-                    return
+                    return "Stop sent to the plotter."
                 termios.tcflush(fd, termios.TCOFLUSH)
                 # Flow control off, so the abort gets through while the cutter is holding us off.
                 a = termios.tcgetattr(fd)
@@ -1174,6 +1470,16 @@ class Port:
                 end = time.monotonic() + 1.0
                 while self._queued(fd) and time.monotonic() < end:
                     time.sleep(0.02)
+                self.pending, self.rx = None, b""      # ESC.K threw away any query still in its buffer
+                if not self.talk["ever"]:
+                    return "Stop sent to the plotter."
+                for wait in (0.4, 1.0, 1.5):
+                    time.sleep(wait)
+                    f = self._ask(fd, ESC_B, _p_int, 1.5)
+                    if f is not None and f >= self.talk["bufsize"] - 16:
+                        return "Stopped. The plotter emptied its buffer and lifted the knife."
+                return ("Stop sent, but the plotter did not confirm it. If it is still cutting, press its "
+                        "PAUSE key or switch it off.")
             except (OSError, termios.error) as e:
                 raise PortError("Could not send the stop command (%s)." % e)
             finally:
@@ -1207,6 +1513,7 @@ class Jobs:
         self.total = 0
         self.sent = 0
         self.waiting = False
+        self.tracked = False     # True when the plotter itself reports how far the cut has got
         self.message = ""
 
     def busy(self):
@@ -1218,20 +1525,24 @@ class Jobs:
                 raise PortError("A job is already running.")
             self.stop.clear()
             self.state, self.name, self.total, self.sent = "sending", name, len(data), 0
-            self.waiting, self.message = False, ""
+            self.waiting, self.message, self.tracked = False, "", False
         threading.Thread(target=self._run, args=(data,), daemon=True).start()
 
-    def _progress(self, sent, waiting):
-        self.sent, self.waiting = sent, waiting
+    def _progress(self, sent, waiting, tracked=False):
+        self.sent, self.waiting, self.tracked = sent, waiting, tracked
 
     def _run(self, data):
         try:
-            self.port.send(data, self.stop, self._progress)
-            state, msg = "done", ""
+            res = self.port.send(data, self.stop, self._progress) or {}
+            state = "done"
+            msg = "Done. The plotter has finished cutting." if res.get("tracked") else ""
+            err = res.get("plotter_error")
+            if err:
+                msg = ("Finished, but the plotter reported error %d (%s). Part of the cut may be missing."
+                       % (err, HPGL_ERRORS.get(err, "unknown error")))
         except Cancelled:
             try:
-                self.port.abort()
-                state, msg = "stopped", "Stopped."
+                state, msg = "stopped", self.port.abort() or "Stopped."
             except PortError as e:
                 state, msg = "error", str(e)
         except PortError as e:
@@ -1249,8 +1560,7 @@ class Jobs:
                 return
         # Nothing being sent: the cutter may still be working through its own buffer.
         try:
-            self.port.abort()
-            state, msg = "stopped", "Stop sent to the plotter."
+            state, msg = "stopped", self.port.abort() or "Stop sent to the plotter."
         except PortError as e:
             state, msg = "error", str(e)
         with self.lock:
@@ -1260,7 +1570,8 @@ class Jobs:
     def snapshot(self):
         with self.lock:
             return {"state": self.state, "name": self.name, "total": self.total,
-                    "sent": self.sent, "waiting": self.waiting, "message": self.message}
+                    "sent": self.sent, "waiting": self.waiting, "message": self.message,
+                    "tracked": self.tracked}
 
 
 # ----------------------------------------------------------------------------
@@ -1342,6 +1653,35 @@ class App:
         self.auth = Auth(self.cfg, data_dir)
         self.cache = {}
         self.cache_lock = threading.Lock()
+        self.applied_width = None          # last width taken from the plotter
+
+    def start_watch(self):
+        threading.Thread(target=self._watch, daemon=True).start()
+
+    def _watch(self):
+        while True:
+            time.sleep(2)
+            try:
+                if not self.jobs.busy():
+                    self.port.watch()
+                self.take_width()
+            except Exception as e:          # the watcher must keep running
+                sys.stderr.write("zombiePlot: plotter watch: %s\n" % e)
+
+    def take_width(self):
+        """Use the width the plotter reports, each time it reports a new one (new vinyl loaded)."""
+        w = self.port.width_mm()
+        if not w or not self.cfg.get("auto_width"):
+            return
+        if self.applied_width is not None and abs(w - self.applied_width) < 0.5:
+            return
+        self.applied_width = w
+        if abs(self.cfg.get("vinyl_width_mm") - w) > 0.05:
+            self.cfg.update({"vinyl_width_mm": w})
+
+    def width_from_plotter(self):
+        w = self.port.width_mm()
+        return bool(w and self.cfg.get("auto_width") and abs(self.cfg.get("vinyl_width_mm") - w) < 0.5)
 
     # ---- files ----
 
@@ -1606,6 +1946,7 @@ class App:
         return {"port": self.port.status(), "job": self.jobs.snapshot(), "version": VERSION,
                 "update": up if up and parse_version(up) > parse_version(VERSION) else None,
                 "vinyl": {"width_mm": min(self.cfg.get("vinyl_width_mm"), self.cfg.get("cut_width_mm")),
+                          "from_plotter": self.width_from_plotter(),
                           "used_mm": ses["used_mm"], "jobs": ses["jobs"],
                           "units": self.cfg.get("units"), "start_corner": self.cfg.get("start_corner"),
                           "origin_side": origin_side(self.cfg.snapshot()), "origin_row": origin_row(self.cfg.snapshot())},
@@ -2084,7 +2425,14 @@ class Handler(BaseHTTPRequestHandler):
                 if path == "/api/settings":
                     body.pop("pin_hash", None)
                     try:
+                        before = app.cfg.snapshot()
                         saved = app.cfg.update(body)
+                        if ((saved["auto_width"] and not before["auto_width"])
+                                or saved["swap_axes"] != before["swap_axes"]
+                                or saved["steps_per_mm"] != before["steps_per_mm"]):
+                            app.applied_width = None       # take the plotter's width again now
+                            app.take_width()
+                            saved = app.cfg.snapshot()
                         saved.pop("pin_hash", None)
                         return self._json({"ok": True, "settings": saved})
                     except ValueError as e:
@@ -2348,7 +2696,8 @@ details{margin:14px 2px}summary{cursor:pointer;color:var(--dim);font-size:14px}
 
   <h2>Vinyl</h2>
   <label class="f"><span id="l-vw">Usable vinyl width</span><input id="s-vw" inputmode="decimal"></label>
-  <p class="note">How far across the plotter can cut on the vinyl loaded now. Change it when you load a different width.</p>
+  <label class="c"><input type="checkbox" id="s-autow">Take the width from the plotter</label>
+  <p class="note" id="vw-note">How far across the plotter can cut on the vinyl loaded now. Change it when you load a different width.</p>
   <label class="f"><span id="l-gap">Gap between copies and jobs</span><input id="s-gap" inputmode="decimal"></label>
   <label class="f">When the job ends<select id="s-end"><option value="origin">Return to the start point</option><option value="next">Move to the next free spot</option><option value="advance">Feed the vinyl past the job</option></select></label>
   <label class="f">Overcut on closed shapes (mm)<input id="s-over" inputmode="decimal"></label>
@@ -2366,7 +2715,7 @@ details{margin:14px 2px}summary{cursor:pointer;color:var(--dim);font-size:14px}
 
   <h2>Connection</h2>
   <label class="f">Cable type<select id="s-link"><option value="auto">Find it automatically</option><option value="parallel">Parallel (USB-to-parallel cable)</option><option value="serial">Serial (USB-to-serial cable)</option></select></label>
-  <label class="f">Flow control, serial only (plotter menu: H-WIRE = Hardware)<select id="s-flow"><option value="hardware">Hardware</option><option value="xonxoff">XON/XOFF</option><option value="none">None</option></select></label>
+  <label class="f">Flow control, serial only (plotter menu: H-WIRE = Hardware). Not used when the plotter answers zombiePlot: then zombiePlot paces the data itself.<select id="s-flow"><option value="hardware">Hardware</option><option value="xonxoff">XON/XOFF</option><option value="none">None</option></select></label>
   <label class="f">Baud rate, serial only<select id="s-baud"><option>2400</option><option>4800</option><option>9600</option><option>19200</option></select></label>
   <label class="f">Port ("auto" finds the cable)<input id="s-port" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
   <label class="f">Plotter units per mm (Roland CAMM-1 and HP-GL: 40)<input id="s-upm" inputmode="decimal"></label>
@@ -2550,7 +2899,7 @@ function paintVinyl(){
   const v = S.status && S.status.vinyl;
   if(!v){ $("vtxt").textContent = "Vinyl"; return; }
   S.units = v.units || S.units;
-  let t = "<b>" + len(v.width_mm) + "</b> vinyl &middot; ";
+  let t = "<b>" + len(v.width_mm) + "</b> vinyl" + (v.from_plotter ? " (from plotter)" : "") + " &middot; ";
   t += v.jobs ? len(v.used_mm) + " used (" + v.jobs + " job" + (v.jobs === 1 ? "" : "s") + ")" : "nothing cut yet";
   $("vtxt").innerHTML = t;
   $("vundo").hidden = !v.jobs;
@@ -2560,25 +2909,28 @@ function paint(){
   const st = S.status, job = st && st.job, sending = job && (job.state === "sending" || job.state === "stopping");
   const pill = $("pill"); let cls = "", txt = "Checking";
   if(!st){ cls = "bad"; txt = "Offline"; }
-  else if(sending){ cls = "ok"; txt = job.state === "stopping" ? "Stopping" : "Sending " + Math.floor(100 * job.sent / Math.max(1, job.total)) + "%"; }
+  else if(sending){ cls = "ok"; txt = job.state === "stopping" ? "Stopping" : (job.tracked ? "Cutting " : "Sending ") + Math.floor(100 * job.sent / Math.max(1, job.total)) + "%"; }
   else if(st.port.state === "missing"){ cls = "bad"; txt = "No cable"; }
   else if(st.port.state === "notready"){ cls = "warn"; txt = "Not ready"; }
   else { cls = "ok"; txt = "Ready"; }
   if(st && !sending && st.port.link && st.port.state !== "missing") txt += " \u00b7 " + (st.port.link === "serial" ? "SER" : "PAR");
   pill.className = cls; pill.lastChild.textContent = txt;
+  if(job && S.lastJob && S.lastJob !== job.state && job.state === "done" && navigator.vibrate) navigator.vibrate([150, 80, 150]);
+  S.lastJob = job ? job.state : "";
   paintVinyl();
   paintUpNote();
   const cut = $("cut");
   cut.disabled = !!sending || !S.pv || !S.pv.fits || !st;
   const armed = S.armed && Date.now() < S.armed;
-  cut.textContent = sending ? "SENDING" : armed ? (S.pv && S.pv.clash ? "CUTS OVER USED VINYL - TAP AGAIN" : "TAP AGAIN TO CUT") : "CUT";
+  cut.textContent = sending ? (job.tracked ? "CUTTING" : "SENDING") : armed ? (S.pv && S.pv.clash ? "CUTS OVER USED VINYL - TAP AGAIN" : "TAP AGAIN TO CUT") : "CUT";
   $("prog").hidden = !sending;
   if(sending) $("bar").style.width = (100 * job.sent / Math.max(1, job.total)).toFixed(1) + "%";
   let m = "";
   if(job){
-    if(job.state === "sending") m = job.waiting ? "Waiting for the plotter to take more data." : "Sending " + job.name + " to the plotter.";
+    if(job.state === "sending" && job.tracked) m = job.waiting ? "The plotter has paused. Check its panel." : "Cutting " + job.name + ".";
+    else if(job.state === "sending") m = job.waiting ? "Waiting for the plotter to take more data." : "Sending " + job.name + " to the plotter.";
     else if(job.state === "stopping") m = "Stopping.";
-    else if(job.state === "done") m = "Sent. The plotter keeps cutting until it finishes what it was sent.";
+    else if(job.state === "done") m = job.message || "Sent. The plotter keeps cutting until it finishes what it was sent.";
     else if(job.state === "stopped" || job.state === "error") m = job.message;
   }
   if(S.view === "job") $("jobmsg").textContent = m;
@@ -2586,12 +2938,22 @@ function paint(){
   if(sending && S.view === "set"){ $("up-install").disabled = true; $("up-back").disabled = true; }
 }
 
+function plotterLine(p){
+  let m = "Plotter" + (p.model ? " (model " + p.model + ")" : "") + " connected on " + p.device + " (" + p.link + ").";
+  if(p.link === "serial" && p.answers){
+    m += " It answers zombiePlot, so cut progress is live";
+    m += p.width_mm ? " and it reports " + len(p.width_mm) + " of cutting width." : ".";
+  } else if(p.link === "serial" && p.answers === false)
+    m += " It does not answer zombiePlot, so its width and cut progress cannot be read. That needs a two-way serial cable and the plotter's I/O set to SERIAL or AUTO.";
+  return m;
+}
+
 function pillDetail(){
   const st = S.status; let m = "";
   if(!st) m = "Cannot reach the zombiePlot box. Check that it has power and is on Wi-Fi.";
   else if(st.port.state === "missing") m = st.port.message;
   else if(st.port.state === "notready") m = st.port.message;
-  else m = "Plotter connected on " + st.port.device + " (" + st.port.link + ").";
+  else m = plotterLine(st.port);
   const box = $("pillmsg"); box.textContent = m; box.className = "msg" + (st && st.port.state !== "missing" && st.port.state !== "notready" ? " ok" : " bad");
   box.hidden = false; window.scrollTo(0,0); setTimeout(() => { box.hidden = true; }, 9000);
 }
@@ -2631,6 +2993,11 @@ async function loadSettings(){
   $("l-vw").textContent = "Usable vinyl width (" + s.units + ")";
   $("s-width").value = +(s.cut_width_mm / u).toFixed(d); $("s-gap").value = +(s.copy_gap_mm / u).toFixed(d);
   $("s-vw").value = +(s.vinyl_width_mm / u).toFixed(d);
+  $("s-autow").checked = !!s.auto_width;
+  const pw = S.status && S.status.port && S.status.port.width_mm;
+  $("vw-note").textContent = pw
+    ? "The plotter reports " + len(pw) + " of cutting width. With the box ticked, zombiePlot uses that each time it changes (when you load new vinyl). A width you type is kept until then."
+    : "How far across the plotter can cut on the vinyl loaded now. Change it when you load a different width. A plotter on a two-way serial cable reports this itself.";
   $("s-tsleep").value = String(s.thing_sleep_min);
   $("s-units").value = s.units; $("s-end").value = s.end_action; $("s-over").value = s.overcut_mm;
   $("s-swap").checked = s.swap_axes; $("s-mc").checked = s.mirror_carriage; $("s-mf").checked = s.mirror_feed;
@@ -2647,7 +3014,7 @@ async function saveSettings(){
   const u = S.settings.units === "mm" ? 1 : 25.4;
   const body = {
     cut_width_mm: parseFloat($("s-width").value) * u, copy_gap_mm: parseFloat($("s-gap").value) * u,
-    vinyl_width_mm: parseFloat($("s-vw").value) * u, thing_sleep_min: parseInt($("s-tsleep").value, 10),
+    vinyl_width_mm: parseFloat($("s-vw").value) * u, auto_width: $("s-autow").checked, thing_sleep_min: parseInt($("s-tsleep").value, 10),
     units: $("s-units").value, end_action: $("s-end").value, overcut_mm: parseFloat($("s-over").value),
     link: $("s-link").value, flow: $("s-flow").value, baud: parseInt($("s-baud").value, 10),
     port: $("s-port").value.trim() || "auto", px_per_inch: parseFloat($("s-ppi").value),
@@ -3402,7 +3769,7 @@ function paint(){
   var st = S.status, job = st && st.job, busy = sending();
   var pill = $("pill"), cls = "", txt = "Checking";
   if(!st){ cls = "bad"; txt = "Offline"; }
-  else if(busy){ cls = "ok"; txt = job.state === "stopping" ? "Stopping" : "Sending " + Math.floor(100 * job.sent / Math.max(1, job.total)) + "%"; }
+  else if(busy){ cls = "ok"; txt = job.state === "stopping" ? "Stopping" : (job.tracked ? "Cutting " : "Sending ") + Math.floor(100 * job.sent / Math.max(1, job.total)) + "%"; }
   else if(st.port.state === "missing"){ cls = "bad"; txt = "No cable"; }
   else if(st.port.state === "notready"){ cls = "warn"; txt = "Not ready"; }
   else { cls = "ok"; txt = "Ready"; }
@@ -3411,7 +3778,7 @@ function paint(){
   var v = st && st.vinyl;
   if(v){
     S.units = v.units || S.units;
-    $("vtxt").innerHTML = "<b>" + len(v.width_mm) + "</b> vinyl &middot; " +
+    $("vtxt").innerHTML = "<b>" + len(v.width_mm) + "</b> vinyl" + (v.from_plotter ? " (from plotter)" : "") + " &middot; " +
       (v.jobs ? len(v.used_mm) + " used (" + v.jobs + " job" + (v.jobs === 1 ? "" : "s") + ")" : "nothing cut yet");
   } else $("vtxt").textContent = "";
   $("bar2").style.width = busy ? (100 * job.sent / Math.max(1, job.total)).toFixed(1) + "%" : "0";
@@ -3443,6 +3810,14 @@ async function poll(){
   if(S.status && S.status.version){
     if(!S.loadedVersion) S.loadedVersion = S.status.version;
     else if(S.status.version !== S.loadedVersion){ location.reload(); return; }   /* the box was updated */
+  }
+  var j = S.status && S.status.job;
+  if(j){
+    var was = S.jobState; S.jobState = j.state;
+    if((was === "sending" || was === "stopping") && j.state !== was){
+      if(j.state === "done") toast(j.message || "Sent. The plotter keeps cutting until it finishes.", !/error/.test(j.message));
+      else if(j.message) toast(j.message, j.state === "stopped");
+    }
   }
   var jobs = S.status && S.status.vinyl ? S.status.vinyl.jobs : -1;
   if(jobs !== S.vjobs){ var first = S.vjobs === -1; S.vjobs = jobs; if(!first && S.view === "job") refreshPreview(); }
@@ -3520,10 +3895,13 @@ function setRows(){
   var c = S.cfg;
   if(!c) return [];
   var vw = S.sedit !== null ? S.sedit : c.vinyl_width_mm;
+  var v = S.status && S.status.vinyl, pw = S.status && S.status.port && S.status.port.width_mm;
   return [
-    {label:"Vinyl width", value:len(Math.min(vw, c.cut_width_mm)), run:function(){
+    {label:"Vinyl width", value:len(Math.min(vw, c.cut_width_mm)) + (S.sedit === null && v && v.from_plotter ? ", from plotter" : ""), run:function(){
        if(S.sedit === null){ S.sedit = c.vinyl_width_mm; paintSet(); }
        else { var v = S.sedit; S.sedit = null; saveSet({vinyl_width_mm: v}, "Vinyl width saved."); } }},
+    {label:"Width from plotter", value:(c.auto_width ? "On" : "Off") + (pw ? " (reads " + len(pw) + ")" : ""), run:function(){
+       saveSet({auto_width: !c.auto_width}, c.auto_width ? "Width from plotter off: the width you set is kept." : "Width from plotter on."); }},
     {label:"Screen sleep", value:c.thing_sleep_min ? c.thing_sleep_min + " min" : "Never", run:function(){
        var i = SLEEPS.indexOf(+c.thing_sleep_min); saveSet({thing_sleep_min: SLEEPS[(i + 1) % SLEEPS.length]}); }},
     {label:"Show sizes in", value:c.units === "mm" ? "mm" : "inches", run:function(){ saveSet({units: c.units === "mm" ? "in" : "mm"}); }},
@@ -3656,6 +4034,7 @@ def main():
         sys.exit(run_updater(args.data, args.auto))
     os.makedirs(args.data, exist_ok=True)
     Handler.app = App(args.data, args.library)
+    Handler.app.start_watch()
     srv = ThreadingHTTPServer(("", args.port), Handler)
     srv.daemon_threads = True
     sys.stderr.write("zombiePlot %s: web page on port %d, files in %s\n"

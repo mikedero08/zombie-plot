@@ -32,15 +32,21 @@ def post(path, obj=None, raw=None):
         return e.code, json.loads(e.read())
 
 def drain(fd, quiet=0.6, limit=20):
-    """Read from the fake plotter until nothing arrives for `quiet` seconds."""
+    """Read from the fake plotter until nothing arrives for `quiet` seconds.
+    The buffer queries zombiePlot sends to see whether the plotter answers are left out:
+    this fake plotter never answers, like one on a one-way cable."""
     buf = b""
     end = time.time() + limit
     while time.time() < end:
         r, _, _ = select.select([fd], [], [], quiet)
         if not r:
-            break
+            if buf.replace(b"\x1b.B", b""):
+                break
+            if time.time() > end - limit + 4:      # nothing but queries for 4 s: nothing is coming
+                break
+            continue
         buf += os.read(fd, 65536)
-    return buf
+    return buf.replace(b"\x1b.B", b"")
 
 def wait_state(states, limit=20):
     end = time.time() + limit
@@ -148,8 +154,12 @@ try:
     s = getj("/api/status")[1]["job"]
     check("job blocks when plotter stops taking data", s["state"] == "sending" and 0 < s["sent"] < total, s)
     c, j2 = post("/api/cut", {"id": ids["decal.svg"], "copies": 1}); check("second job refused while busy", c == 400 and "already" in j2["error"], j2)
-    time.sleep(2.2)
-    s = getj("/api/status")[1]["job"]
+    s = {}
+    for _ in range(40):
+        time.sleep(0.25)
+        s = getj("/api/status")[1]["job"]
+        if s["waiting"]:
+            break
     check("reports waiting after 3 s stall", s["waiting"] is True, s)
     post("/api/stop")
     s = wait_state(("stopped", "error"))

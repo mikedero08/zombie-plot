@@ -33,12 +33,32 @@ A small Raspberry Pi sits next to the cutter and stays switched on. You open a w
 
 | | |
 |---|---|
-| **Tested** | Roland CAMM-1 PNC-1210, connected with a Prolific PL2305 USB-to-parallel cable (sold as "USB to IEEE-1284" or "USB to Centronics" printer cables). |
+| **Tested** | Roland CAMM-1 PNC-1210, connected with a Prolific PL2305 USB-to-parallel cable (sold as "USB to IEEE-1284" or "USB to Centronics" printer cables), and with a Prolific PL2303 USB-to-serial cable plus a null-modem adapter. |
 | **Should work** | Other Roland CAMM-1 cutters of the same era that take CAMM-GL III / HP-GL commands, such as the PNC-900, 910, 950, 960, 1000, 1100, 1200, 1410, 1600, 1850 and 1860. Connect with a USB-to-parallel cable or a USB-to-serial cable. |
 | **Probably works** | Other cutters and pen plotters that accept HP-GL (the `PU`/`PD` commands) over a parallel or serial port. If yours uses a step other than 0.025 mm, change "Plotter units per mm" in Settings. |
 | **Will not work** | Cricut, Silhouette, Brother ScanNCut and other cutters with closed protocols. Also cutters that only work through their own Windows driver. |
 
 The cable has to appear on the Pi as a printer port (`/dev/usb/lp0`) or a serial port (`/dev/ttyUSB0`). Both kinds of cable described above do.
+
+### Serial gives you more
+
+Over a two-way serial cable the plotter answers zombiePlot, which gives you:
+
+- **The vinyl width**, read from the plotter. It is read again whenever it changes, for example when you load new vinyl.
+- **Real cut progress and a real "done".** zombiePlot sends only what fits in the plotter's buffer, and asks after every block how much room is left. The percentage is what the plotter has actually cut, and the job finishes when the plotter has finished cutting.
+- **A confirmed stop.** After Stop, the plotter reports that its buffer is empty.
+- **Plotter errors** reported after the cut, and the plotter's model number.
+
+A parallel cable only sends data, so with one the page shows what has been sent, not what has been cut.
+
+For serial you need:
+
+- A USB-to-serial cable.
+- A **null-modem** adapter. A Roland's serial port needs the send and receive wires crossed. With a straight cable the plotter does nothing.
+- The plotter set to the same baud rate as zombiePlot, 8 data bits, no parity, 1 stop bit. 9600 is the default.
+- The plotter's I/O set to SERIAL or AUTO.
+
+To check that the plotter answers, tap the status light. It says "It answers zombiePlot" and gives the width the plotter reports.
 
 ---
 
@@ -140,7 +160,7 @@ The switches the test sets are under **Manual switches** on the same screen, for
 
 ### The status light
 
-At the top right: **Ready** (green), **Not ready** (amber), or **No cable** (red). After it comes **PAR** or **SER**, showing whether the cutter is connected through a parallel or a serial cable. Tap it for details.
+At the top right: **Ready** (green), **Not ready** (amber), or **No cable** (red). After it comes **PAR** or **SER**, showing whether the cutter is connected through a parallel or a serial cable. During a cut it reads **Cutting** and a percentage when the plotter reports its progress (serial), or **Sending** and a percentage when it can't (parallel). Tap it for details, including the plotter's model and the width it reports.
 
 ### The vinyl bar
 
@@ -176,6 +196,7 @@ All positions are measured from the cutter's start point (origin). The page move
 |---|---|---|
 | Access PIN | Without a PIN, anyone on your network can use the page. With one, each phone or computer asks for it once. | none |
 | Usable vinyl width | Same as Width on the vinyl bar. | Plotter width |
+| Take the width from the plotter | Serial only. Uses the width the plotter reports, every time it changes. A width you type is kept until the plotter reports a different one. The vinyl bar shows "(from plotter)" when the plotter's width is in use. | on |
 | Gap between copies and jobs | Space left between copies and between jobs. | 5 mm |
 | When the job ends | Return to the start point; move to the next free spot so you can see where the next job goes; or feed the vinyl past the job so you can cut it off. | Return |
 | Overcut on closed shapes | Cuts slightly past the start of each closed shape so the corner weeds cleanly. 0 turns it off. | 1 mm |
@@ -183,7 +204,7 @@ All positions are measured from the cutter's start point (origin). The page move
 | Widest the plotter can cut | The machine's limit. The vinyl width can't be set wider than this. PNC-1210: 584 mm (23 in). | 584 mm |
 | Plotter setup | The picture test (Step 6). Settings shows the result as a small picture: where the start point is. | front left until the test is run |
 | Cable type | Parallel or serial; automatic finds it. | automatic |
-| Flow control, Baud rate | Serial cables only; must match the cutter's serial settings. | Hardware, 9600 |
+| Flow control, Baud rate | Serial cables only. Baud must match the cutter. Flow control only matters when the plotter does not answer: when it answers, zombiePlot paces the data from the plotter's own buffer reports. | Hardware, 9600 |
 | Port | `auto` finds the cable. | auto |
 | Plotter units per mm | 40 for Roland CAMM-1 and standard HP-GL (0.025 mm steps). | 40 |
 | Pixels per inch | Only for SVG files that contain no inch or mm size. The page warns when a file is like that. | 96 |
@@ -402,7 +423,7 @@ zombiePlot is built for a home or shop network. See [SECURITY.md](SECURITY.md) f
   - The page in a phone-sized browser.
 - **Not tested:**
   - Other cutter models.
-  - Serial cables on real hardware.
+  - The serial features (width, progress, stop, errors) on the real PNC-1210. They are tested against a simulated Roland. On the real PNC-1210 a serial cable with a null modem has moved the carriage, and the plotter answered the model query with `1210`.
   - Whether the Stop command (`ESC .K`) works over a parallel cable on every model.
   - The Car Thing remote's screen on a real Car Thing. Flashing with the Thing Labs image and the USB network link have been tested on a real Car Thing and Pi Model B+; the page has been tested in a browser at 800 × 480 with the dial and buttons simulated.
 

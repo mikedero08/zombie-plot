@@ -27,11 +27,15 @@ srv = subprocess.Popen([sys.executable, os.path.join(ROOT, "zombieplot.py"), "--
 time.sleep(0.8)
 
 def drain(quiet=0.6):
-    buf = b""
+    """What the fake plotter received, without the buffer queries (it never answers them)."""
+    buf, began = b"", time.time()
     while True:
         r, _, _ = select.select([master], [], [], quiet)
         if not r:
-            return buf
+            data = buf.replace(b"\x1b.B", b"")
+            if data or time.time() - began > max(quiet, 2.0) or not buf:
+                return data
+            continue
         buf += os.read(master, 65536)
 
 errors = []
@@ -305,7 +309,7 @@ try:
         check("thing: top-right button says Settings when idle", pc.inner_text("#km b") == "Settings")
         pc.keyboard.press("m")
         pc.wait_for_selector("#v-set:not([hidden])")
-        pc.wait_for_function("document.querySelectorAll('#slist li').length === 5")
+        pc.wait_for_function("document.querySelectorAll('#slist li').length === 6")
         pc.screenshot(path=os.path.join(OUT, "thing_settings.png"))
         w0 = json.load(open(cfgp))["vinyl_width_mm"]
         pc.keyboard.press("Enter")                       # edit vinyl width
@@ -316,6 +320,11 @@ try:
         pc.wait_for_timeout(400)
         w1 = json.load(open(cfgp))["vinyl_width_mm"]
         check("thing settings: dial changes the vinyl width by one step", 4.9 < w1 - w0 < 6.4, (w0, w1))
+        pc.mouse.wheel(30, 0); pc.wait_for_timeout(150)  # to Width from plotter
+        a0 = json.load(open(cfgp))["auto_width"]
+        pc.keyboard.press("Enter"); pc.wait_for_timeout(500)
+        check("thing settings: width from plotter toggles", json.load(open(cfgp))["auto_width"] is (not a0))
+        pc.keyboard.press("Enter"); pc.wait_for_timeout(500)
         pc.mouse.wheel(30, 0); pc.wait_for_timeout(150)  # to Screen sleep
         pc.keyboard.press("Enter"); pc.wait_for_timeout(500)
         check("thing settings: screen sleep steps on", json.load(open(cfgp))["thing_sleep_min"] == 1)
