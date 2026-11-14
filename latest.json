@@ -1,1 +1,1 @@
-{"version": "2.0", "ref": "de00d1da654b403d6150d48ce2cca6c5c36d7db7", "notes": "Serial: vinyl width from the plotter, real cut progress and finish, confirmed stop, plotter errors."}
+{"version": "2.1", "ref": "30be132d4ae4d0e4a88372057147d9020fc2419b", "notes": "At the knife placement, vinyl width measured from the start point, sheet memory follows the ORIGIN key."}
