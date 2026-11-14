@@ -210,6 +210,7 @@ All positions are measured from the cutter's start point (origin). The page move
 | Port | `auto` finds the cable. | auto |
 | Plotter units per mm | 40 for Roland CAMM-1 and standard HP-GL (0.025 mm steps). | 40 |
 | Pixels per inch | Only for SVG files that contain no inch or mm size. The page warns when a file is like that. | 96 |
+| Plotter tests | Serial only. **Ask the plotter everything it can report** asks a fixed list of questions and shows the answers. **Motion test** moves the knife, up, 200 mm (8 in) across and back, and records every status the plotter gives as it moves. Tap **It stopped** when it stops. Nothing is cut, and neither test runs during a cut. | |
 
 Force and speed are not sent. Set them on the cutter as usual.
 

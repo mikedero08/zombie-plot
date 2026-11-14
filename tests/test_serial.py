@@ -325,6 +325,55 @@ try:
     sess = app.session.snapshot()["items"]
     check("start point back: sheet memory back", len(sess) == 1 and abs(sess[0]["x"] - 66.325) < 0.01 and abs(sess[0]["y"] - 51.175) < 0.01, sess)
 
+
+    # --- Plotter tests page ---
+    c, d = api("/api/diag/run", {"test": "query"})
+    check("query test starts", c == 200 and d["state"] == "running", d)
+    d = None
+    for _ in range(300):
+        d = api("/api/diag")[1]
+        if d["state"] != "running":
+            break
+        time.sleep(0.2)
+    vals = {e["what"].split()[0]: e["value"] for e in d["log"]}
+    check("query test finishes", d["state"] == "done", d)
+    check("query test: answers recorded", vals.get("OI") == "1210" and vals.get("ESC.B") == "2048" and vals.get("OA", "").startswith("0,"), vals)
+    check("query test: unknown commands skipped safely", "does not know" in vals.get("OW", "") and "OF" in vals, vals)
+    check("query test: nothing left waiting", app.port.pending is None and plotter.overlap == 0, (app.port.pending, plotter.overlap))
+    c, d = api("/api/diag/run", {"test": "rm -rf"})
+    check("unknown test refused", c == 400, d)
+    with plotter.lock:
+        plotter.cut.clear()
+    c, d = api("/api/diag/run", {"test": "motion"})
+    check("motion test starts", c == 200 and d["state"] == "running", d)
+    c, j = api("/api/cut", {"id": ids["decal.svg"], "copies": 1})
+    check("no cutting during a test", c == 400 and "test is running" in j["error"], j)
+    time.sleep(6)
+    api("/api/diag/mark", {})
+    for _ in range(150):
+        d = api("/api/diag")[1]
+        if d["state"] != "running":
+            break
+        time.sleep(0.2)
+    whats = [e["what"] for e in d["log"]]
+    check("motion test finishes with a timeline", d["state"] == "done" and "moves sent" in whats and "YOU" in whats and "end" in whats, d)
+    sent = bytes(plotter.cut)
+    check("motion test is knife up only, across only", b"PD" not in sent and b"PU0,8000;" in sent and b"PU0,4000;" in sent, sent[:120])
+    c, d = api("/api/diag/run", {"test": "motion"})
+    time.sleep(5)
+    api("/api/stop", {})
+    for _ in range(50):
+        d = api("/api/diag")[1]
+        if d["state"] != "running":
+            break
+        time.sleep(0.2)
+    check("Stop ends a test", d["state"] == "stopped" and plotter.got_abort >= 2, (d["state"], plotter.got_abort))
+    plotter.clip = "-6600,-8000,993320,1568"         # only 39 mm from the start point
+    wait(lambda s: s["port"]["width_mm"] and s["port"]["width_mm"] < 50)
+    c, d = api("/api/diag/run", {"test": "motion"})
+    check("motion test refused without room", c == 400 and "reports only" in d["error"], d)
+    plotter.clip = "-6600,0,993320,11568"
+
     check("still never an overlap", plotter.overlap == 0, plotter.overlap)
     check("never overflowed", plotter.overflow == 0, plotter.overflow)
 finally:

@@ -40,7 +40,7 @@ except ImportError:       # Windows: only --car-thing-install is meant to run th
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "2.1.1"
+VERSION = "2.2"
 UNITS_PER_MM = 40.0          # CAMM-GL III step = 0.025 mm
 FLATTEN_TOL_MM = 0.03        # curve-to-line tolerance (about one cutter step)
 MAX_UPLOAD = 25 * 1024 * 1024
@@ -929,6 +929,17 @@ HPGL_ERRORS = {1: "a command it does not recognise", 2: "a command with the wron
                6: "a position outside its cutting area", 7: "its buffer overflowed"}
 
 
+# Plotter tests page: fixed questions only. Nothing typed by a user is ever sent to the plotter.
+DIAG_DEVICE = (("ESC.A identification", b"\x1b.A"), ("ESC.B buffer free", b"\x1b.B"),
+               ("ESC.L buffer size", b"\x1b.L"), ("ESC.O extended status", b"\x1b.O"),
+               ("ESC.E extended error", b"\x1b.E"), ("ESC.S configuration", b"\x1b.S"))
+DIAG_HPGL = (("OI model", b"OI;"), ("OS status", b"OS;"), ("OE error", b"OE;"),
+             ("OA knife position", b"OA;"), ("OC commanded position", b"OC;"),
+             ("OH cutting area", b"OH;"), ("OW window", b"OW;"), ("OP P1 and P2", b"OP;"),
+             ("OF units per mm", b"OF;"))
+DIAG_MOVE_MM = 200.0           # the motion test goes this far across, knife up
+
+
 def _p_int(s):
     return int(s) if re.fullmatch(r"\d{1,9}", s) else None
 
@@ -1327,6 +1338,108 @@ class Port:
             return None
         t["answers"], t["ever"] = True, True
         return free
+
+    def diag(self, kind, stop, log, marks):
+        """Run one of the fixed tests on the Plotter tests page. log gets {t, what, value} entries.
+        marks: times (monotonic) when the user tapped "It stopped"."""
+        if not self.qlock.acquire(timeout=3):
+            raise PortError("The plotter is busy. Try again in a moment.")
+        try:
+            with self.lock:
+                fd = self._open()
+                if self.is_parallel():
+                    raise PortError("Plotter tests need a serial cable. A parallel cable only sends.")
+            if not self.talk["ever"]:
+                raise PortError("The plotter is not answering zombiePlot. Tap the status light for details.")
+            self._pending_settled(fd, 1.0)
+            if self.pending:
+                raise PortError("The plotter has not answered an earlier question yet. Check it is online "
+                                "(not paused or in a menu), then try again.")
+            t0 = [time.monotonic()]
+            raw = lambda v: v
+
+            def rec(what, value):
+                log.append({"t": round(time.monotonic() - t0[0], 2), "what": what, "value": value})
+
+            def hpgl(cmd, timeout):
+                """One HP-GL question. If it goes unanswered and the plotter's buffer is empty, the plotter
+                threw it away (a command it does not know), so it is safe to carry on."""
+                v = self._ask(fd, cmd, raw, timeout, hpgl=True)
+                if v is None and self.pending:
+                    free = self._ask(fd, ESC_B, _p_int, 1.5)
+                    if free is not None and free >= self.talk["bufsize"]:
+                        self.pending = None
+                        return None, True
+                    return None, False
+                return v, True
+
+            if kind == "query":
+                for name, cmd in DIAG_DEVICE:
+                    if stop.is_set():
+                        return
+                    v = self._ask(fd, cmd, raw, 1.5)
+                    if v is None:
+                        time.sleep(0.5)
+                        self._catch_up(fd)
+                    rec(name, v if v is not None else "(no answer)")
+                for name, cmd in DIAG_HPGL:
+                    if stop.is_set():
+                        return
+                    v, ok = hpgl(cmd, 2.0)
+                    if v is not None:
+                        rec(name, v)
+                    elif ok:
+                        rec(name, "(no answer: the plotter does not know this one)")
+                    else:
+                        rec(name, "(no answer, still waiting in the plotter: the rest are skipped)")
+                        return
+                return
+
+            # Motion: knife up, across and back four times, ending halfway; watch every status it has.
+            upm = self.cfg.get("steps_per_mm") or UNITS_PER_MM
+            a = int(round(DIAG_MOVE_MM * upm))
+            pt = (lambda v: (0, v)) if self.cfg.get("swap_axes") else (lambda v: (v, 0))
+            self._write_all(fd, b"IN;PU0,0;")
+            rec("setup", "knife up, going to the start point")
+            if stop.wait(4.0):
+                return
+            moves = "".join("PU%d,%d;" % pt(v) for v in (a, 0, a, 0, a, 0, a, 0, a // 2))
+            self._write_all(fd, moves.encode())
+            t0[0] = time.monotonic()
+            rec("moves sent", "4 times %d mm across and back, ending %d mm across" % (DIAG_MOVE_MM, DIAG_MOVE_MM / 2))
+            last, dead, seen = {}, set(), 0
+            asks = (("ESC.O", b"\x1b.O", False), ("ESC.B", ESC_B, False), ("OS", b"OS;", True), ("OA", b"OA;", True))
+            while time.monotonic() - t0[0] < 15 and not stop.is_set():
+                for name, cmd, hp in asks:
+                    if name in dead:
+                        continue
+                    if hp:
+                        v, ok = hpgl(cmd, 2.0)
+                        if v is None and not ok:
+                            rec(name, "(no answer, still waiting in the plotter: test ended)")
+                            return
+                    else:
+                        v = self._ask(fd, cmd, raw, 1.5)
+                    if v is None:
+                        dead.add(name)
+                        rec(name, "(no answer: stopped asking)")
+                    elif last.get(name) != v:
+                        last[name] = v
+                        rec(name, v)
+                while seen < len(marks):
+                    log.append({"t": round(marks[seen] - t0[0], 2), "what": "YOU", "value": "saw it stop"})
+                    seen += 1
+            if stop.is_set():
+                self._write_all(fd, b"\x1b.K;PU;")
+                rec("stopped", "test stopped")
+                return
+            rec("end", ", ".join("%s=%s" % (k, v) for k, v in last.items()))
+        except OSError as e:
+            with self.lock:
+                self._close()
+            raise PortError("Lost the plotter cable (%s)." % e.strerror)
+        finally:
+            self.qlock.release()
 
     def _flow(self, fd, on):
         """Kernel flow control on or off. Off while zombiePlot paces the data from the buffer reports."""
@@ -1727,6 +1840,55 @@ class App:
         self.cache_lock = threading.Lock()
         self.applied_width = None          # last width taken from the plotter
         self.knife_at = None               # (across, along) last read from the plotter, for "At the knife"
+        self.diag_lock = threading.Lock()
+        self.diag_state = {"state": "idle", "test": "", "log": [], "message": "", "started": 0}
+        self.diag_stop = threading.Event()
+        self.diag_marks = []
+
+    def diag_running(self):
+        return self.diag_state["state"] == "running"
+
+    def diag_run(self, test):
+        if test not in ("query", "motion"):
+            raise UserError("Unknown test.")
+        with self.diag_lock:
+            if self.jobs.busy():
+                raise UserError("Wait until the cut has finished.")
+            if self.diag_running():
+                raise UserError("A test is already running.")
+            if test == "motion":
+                w = self.port.width_mm()
+                need = DIAG_MOVE_MM + 5
+                if not w or w < need:
+                    raise UserError("The motion test moves the knife %s across from the start point, knife up. "
+                                    "The plotter %s. Load wider vinyl or move the start point."
+                                    % (fmt_len(DIAG_MOVE_MM, self.cfg.snapshot()),
+                                       "reports only %s" % fmt_len(w, self.cfg.snapshot()) if w else "has not reported its width"))
+            self.diag_stop.clear()
+            self.diag_marks = []
+            self.diag_state = {"state": "running", "test": test, "log": [], "message": "", "started": time.time()}
+            threading.Thread(target=self._diag, args=(test,), daemon=True).start()
+        return self.diag_info()
+
+    def _diag(self, test):
+        st = self.diag_state
+        try:
+            self.port.diag(test, self.diag_stop, st["log"], self.diag_marks)
+            st["state"], st["message"] = ("stopped", "Stopped.") if self.diag_stop.is_set() else ("done", "Finished.")
+        except PortError as e:
+            st["state"], st["message"] = "error", str(e)
+        except Exception as e:
+            st["state"], st["message"] = "error", "Unexpected error: %s" % e
+
+    def diag_mark(self):
+        if self.diag_running():
+            self.diag_marks.append(time.monotonic())
+        return self.diag_info()
+
+    def diag_info(self):
+        st = self.diag_state
+        return {"state": st["state"], "test": st["test"], "message": st["message"],
+                "log": list(st["log"]), "version": VERSION, "started": st["started"]}
 
     def start_watch(self):
         threading.Thread(target=self._watch, daemon=True).start()
@@ -2000,6 +2162,8 @@ class App:
     def cut(self, q):
         if self.jobs.busy():
             raise UserError("A job is already running.")
+        if self.diag_running():
+            raise UserError("A plotter test is running. Wait for it to finish, or stop it in Settings.")
         p = self.plan(q)
         if (q.get("place") == "knife" and p["place"] != "knife") or not p["fits"]:
             raise UserError(p["block"] or p["warnings"][0])
@@ -2494,6 +2658,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(dict(app.preview(q), ok=True))
                 if path == "/api/update":
                     return self._json(app.update_info())
+                if path == "/api/diag":
+                    return self._json(app.diag_info())
                 if path == "/api/settings":
                     snap = app.cfg.snapshot()
                     snap.pop("pin_hash", None)
@@ -2531,8 +2697,15 @@ class Handler(BaseHTTPRequestHandler):
                     app.session.undo()
                     return self._json({"ok": True})
                 if path == "/api/stop":
+                    if app.diag_running():
+                        app.diag_stop.set()
+                        return self._json({"ok": True})
                     app.jobs.request_stop()
                     return self._json({"ok": True})
+                if path == "/api/diag/run":
+                    return self._json(dict(app.diag_run(body.get("test")), ok=True))
+                if path == "/api/diag/mark":
+                    return self._json(dict(app.diag_mark(), ok=True))
                 if path == "/api/settings":
                     body.pop("pin_hash", None)
                     try:
@@ -2686,6 +2859,7 @@ h2{font-size:15px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)
 .setupsum{display:flex;align-items:center;gap:12px;margin:12px 0 6px}
 .setupsum .mini{width:96px;flex:0 0 96px}
 details{margin:14px 2px}summary{cursor:pointer;color:var(--dim);font-size:14px}
+#dg-log{font:12px/1.45 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-all;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px;margin:10px 0;user-select:text;-webkit-user-select:text}
 </style>
 </head>
 <body>
@@ -2834,6 +3008,16 @@ details{margin:14px 2px}summary{cursor:pointer;color:var(--dim);font-size:14px}
   <p id="info" class="note"></p>
   <div id="setmsg" class="msg bad" hidden></div>
   <button id="save" class="wide" style="margin-top:8px;border-color:var(--go);color:var(--go);font-weight:650">Save settings</button>
+
+  <h2>Plotter tests</h2>
+  <p class="note">These show what the plotter reports, for working out problems. They need a serial cable. Nothing is cut: the knife stays up.</p>
+  <button id="dg-query" class="wide">Ask the plotter everything it can report</button>
+  <button id="dg-motion" class="wide" style="margin-top:10px">Motion test: knife up, moves 8 in across and back</button>
+  <p id="dg-hint" class="note" hidden>Watch the carriage. Tap <b>It stopped</b> the moment it stops for good.</p>
+  <button id="dg-mark" class="wide" style="margin-top:10px;background:var(--go);color:var(--go-text);border-color:var(--go);font-weight:700;min-height:62px" hidden>It stopped</button>
+  <button id="dg-stop" class="small wide" style="margin-top:10px" hidden>Stop test</button>
+  <div id="dg-msg" class="msg" hidden></div>
+  <pre id="dg-log" hidden></pre>
 </main>
 
 <script>
@@ -3141,7 +3325,37 @@ async function loadSettings(){
     : "No PIN. Anyone on your network can use this page. Set a PIN if others share your network.";
   $("pin-clear").hidden = !r.pin_set;
   $("info").textContent = "Files folder: " + r.library + " · Cable: " + (r.device || "not found") + " · Version " + r.version;
+  diagPoll();
 }
+
+/* ---------- plotter tests ---------- */
+function paintDiag(d){
+  S.diag = d;
+  const run = d.state === "running";
+  $("dg-query").disabled = run; $("dg-motion").disabled = run;
+  $("dg-mark").hidden = !(run && d.test === "motion"); $("dg-hint").hidden = $("dg-mark").hidden;
+  $("dg-stop").hidden = !run;
+  const box = $("dg-msg");
+  box.hidden = !d.message && !run;
+  box.textContent = run ? (d.test === "motion" ? "Motion test running." : "Asking the plotter.") : d.message;
+  box.className = "msg" + (d.state === "error" ? " bad" : " ok");
+  const log = $("dg-log");
+  log.hidden = !d.log.length;
+  log.textContent = (d.test ? (d.test === "motion" ? "Motion test" : "Everything it reports") + ", zombiePlot " + d.version + "\n" : "") +
+    d.log.map(e => (e.t.toFixed(2) + " s").padStart(8) + "  " + e.what.padEnd(24) + " " + e.value).join("\n");
+}
+async function diagPoll(){
+  try { paintDiag(await api("/api/diag")); } catch(e){ return; }
+  if(S.diag.state === "running") setTimeout(diagPoll, 300);
+}
+async function diagRun(test){
+  try { paintDiag(await post("/api/diag/run", {test})); diagPoll(); }
+  catch(e){ const b = $("dg-msg"); b.textContent = e.message; b.className = "msg bad"; b.hidden = false; }
+}
+$("dg-query").onclick = () => diagRun("query");
+$("dg-motion").onclick = () => diagRun("motion");
+$("dg-mark").onclick = async () => { try { paintDiag(await post("/api/diag/mark")); } catch(e){} };
+$("dg-stop").onclick = async () => { try { await post("/api/stop"); } catch(e){} };
 
 async function saveSettings(){
   const u = S.settings.units === "mm" ? 1 : 25.4;
