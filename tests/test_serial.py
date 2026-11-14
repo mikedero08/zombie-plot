@@ -294,6 +294,8 @@ try:
     check("width after ORIGIN is from the new start point", abs(st["vinyl"]["width_mm"] - 222.88) < 0.01, st["vinyl"])
     sess = app.session.snapshot()["items"]
     check("sheet memory moved with the start point", len(sess) == 1 and abs(sess[0]["x"]) < 0.01 and abs(sess[0]["y"]) < 0.01, sess)
+    mv = status()["vinyl"]["moved"]
+    check("the move is reported for the page", mv and abs(mv["across"] - 66.325) < 0.01 and abs(mv["along"] - 51.175) < 0.01 and mv["dropped"] == 1, mv)
     c, pv = api("/api/preview?id=%s&rot=0&mirror=0&copies=1&place=auto" % ids["decal.svg"])
     check("next free spot avoids the job now at the start point", pv["base"][1] > 50 or pv["base"][0] > 100, pv["base"])
 
@@ -303,9 +305,9 @@ try:
     check("knife near the edge: too wide, blocked", pv["fits"] is False and "past the edge" in pv["warnings"][0], pv["warnings"])
     plotter.pos = (0, -400)
     c, pv = api("/api/preview?id=%s&rot=0&mirror=0&copies=1&place=knife&reread=1" % ids["decal.svg"])
-    check("knife behind the start point: blocked", pv["fits"] is False and any("behind the start point" in w for w in pv["warnings"]), pv["warnings"])
+    check("knife behind the start point: blocked", pv["fits"] is False and any("outside the cutting area" in w for w in pv["warnings"]), pv["warnings"])
     c, j = api("/api/cut", {"id": ids["decal.svg"], "rot": 0, "mirror": False, "copies": 1, "place": "knife"})
-    check("and the cut is refused, with the reason", c == 400 and "behind the start point" in j["error"], j)
+    check("and the cut is refused, with the reason", c == 400 and "outside the cutting area" in j["error"], j)
 
     # --- knife can't be read: falls back for the preview, refuses the cut ---
     plotter.paused = True

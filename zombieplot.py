@@ -40,7 +40,7 @@ except ImportError:       # Windows: only --car-thing-install is meant to run th
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "2.1"
+VERSION = "2.1.1"
 UNITS_PER_MM = 40.0          # CAMM-GL III step = 0.025 mm
 FLATTEN_TOL_MM = 0.03        # curve-to-line tolerance (about one cutter step)
 MAX_UPLOAD = 25 * 1024 * 1024
@@ -1633,6 +1633,7 @@ class Session:
         self.items = []
         self.group = 0
         self.clip = None          # the plotter's cutting area last seen, to notice ORIGIN being pressed
+        self.moved = None         # the last time the start point moved, to tell the user once
         try:
             with open(path, "r", encoding="utf-8") as f:
                 d = json.load(f)
@@ -1660,11 +1661,15 @@ class Session:
                 return False
             if old and (old[2] - old[0], old[3] - old[1]) == (clip[2] - clip[0], clip[3] - clip[1]):
                 da, db = to_vinyl(old[0] - clip[0], old[1] - clip[1])
+                jobs_before = len({i["group"] for i in self.items})
                 for i in self.items:
                     i["x"] -= da
                     i["y"] -= db
-                # forget areas now wholly behind the start point: nothing can be cut there
+                # forget areas now wholly outside the cutting area: the plotter only cuts forward
+                # from its start point, so nothing new can ever land on them
                 self.items = [i for i in self.items if i["x"] + i["w"] > 0 and i["y"] + i["h"] > 0]
+                self.moved = {"id": time.time(), "across": abs(da), "along": abs(db),
+                              "dropped": jobs_before - len({i["group"] for i in self.items})}
                 moved = True
             self.clip = clip
             self._save()
@@ -1679,7 +1684,8 @@ class Session:
             items = [dict(i) for i in self.items]
         used = max([0.0] + [i["y"] + i["h"] for i in items])
         jobs = len({i["group"] for i in items})
-        return {"items": items, "used_mm": used, "jobs": jobs}
+        mv = dict(self.moved, age=time.time() - self.moved["id"]) if self.moved else None
+        return {"items": items, "used_mm": used, "jobs": jobs, "moved": mv}
 
     def add(self, rects, name):
         with self.lock:
@@ -1939,8 +1945,9 @@ class App:
             cy = kb
             if ka < -0.05 or kb < -0.05:
                 fits = False
-                block = ("The knife is behind the start point. Move it onto the vinyl past the "
-                         "start point, then tap At the knife again.")
+                block = ("The knife is outside the cutting area: jobs go from the start point toward "
+                         "the far edge and away from you, and the knife is on the other side of it. "
+                         "Move the knife, then tap At the knife again.")
                 warnings.insert(0, block)
             elif fits and ka + job_w > vinyl_w + 0.01:
                 fits = False
@@ -1955,9 +1962,10 @@ class App:
         if clash:
             items = self.session.snapshot()["items"]
             names = sorted({re.sub(r"(?i)\.svg$", "", items[i]["name"]) for i in clash if i < len(items)})
-            warnings.insert(0, "This spot was already cut on this vinyl (%s). Choose Next free spot, "
-                               "or tap Clear Sheet Memory if you loaded fresh vinyl or set a new start point."
-                            % ", ".join(names))
+            fresh = ("tap Clear Sheet Memory if you loaded new vinyl" if self.port.talk["ever"] else
+                     "tap Clear Sheet Memory if you loaded new vinyl or pressed ORIGIN on the plotter")
+            warnings.insert(0, "This spot was already cut on this vinyl (%s). Choose Next free spot, or %s."
+                            % (", ".join(names), fresh))
         bx = vinyl_w - cx - job_w if far else cx
         by = cy
         mc = machine_flags(cfg)[1]
@@ -2050,7 +2058,7 @@ class App:
                 "update": up if up and parse_version(up) > parse_version(VERSION) else None,
                 "vinyl": {"width_mm": min(self.cfg.get("vinyl_width_mm"), self.cfg.get("cut_width_mm")),
                           "from_plotter": self.width_from_plotter(),
-                          "used_mm": ses["used_mm"], "jobs": ses["jobs"],
+                          "used_mm": ses["used_mm"], "jobs": ses["jobs"], "moved": ses["moved"],
                           "units": self.cfg.get("units"), "start_corner": self.cfg.get("start_corner"),
                           "origin_side": origin_side(self.cfg.snapshot()), "origin_row": origin_row(self.cfg.snapshot())},
                 "thing_sleep_min": self.cfg.get("thing_sleep_min")}
@@ -2950,7 +2958,7 @@ async function refreshPreview(){
       t += "<br>All " + p.copies + ": <b>" + len(p.job_w) + " wide &times; " + len(p.job_h) + " long</b> (" + how + ")";
     }
     const along = p.base[1], across = p.far ? p.vinyl_width - p.base[0] - p.job_w : p.base[0];
-    const at = p.place === "knife" && p.knife ? "Corner at the knife: " + len(p.knife[0]) + " across, " + len(p.knife[1]) + " along from the start point"
+    const at = p.place === "knife" && p.knife ? "The job's " + (p.origin_row === "back" ? "back" : "front") + " " + p.origin_side + " corner is at the knife (" + len(p.knife[0]) + " across, " + len(p.knife[1]) + " along from the start point)"
              : (along < 0.05 && across < 0.05) ? (p.far ? "At the right-hand corner" : "At the start point")
              : "Placed " + len(across) + " across" + (p.far ? " from the right" : "") + ", " + len(along) + " along";
     t += "<br>" + at + " &middot; " + p.shapes + " shape" + (p.shapes === 1 ? "" : "s");
@@ -3047,6 +3055,12 @@ function paint(){
   if(sending && S.view === "set"){ $("up-install").disabled = true; $("up-back").disabled = true; }
 }
 
+function movedText(mv){
+  return "The plotter's start point moved " + len(mv.across) + " across and " + len(mv.along) + " along (ORIGIN was pressed, or the plotter was switched off and on). " +
+         "zombiePlot moved its sheet memory to match, so earlier jobs are still marked where they are on the vinyl." +
+         (mv.dropped ? " " + mv.dropped + " earlier job" + (mv.dropped === 1 ? " is" : "s are") + " now outside the cutting area and no longer shown." : "");
+}
+
 function plotterLine(p){
   let m = "Plotter" + (p.model ? " (model " + p.model + ")" : "") + " connected on " + p.device + " (" + p.link + ").";
   if(p.link === "serial" && p.answers){
@@ -3075,6 +3089,16 @@ async function poll(){
     else if(S.status.version !== S.loadedVersion && !S.updating){ location.reload(); return; }   // the box was updated
   }
   if(S.armed && Date.now() > S.armed) S.armed = 0;
+  const mv = S.status && S.status.vinyl && S.status.vinyl.moved;
+  if(mv && mv.id !== S.moveSeen){
+    if(S.moveSeen !== undefined || mv.age < 120){
+      const box = $("pillmsg"); box.textContent = movedText(mv); box.className = "msg ok"; box.hidden = false;
+      clearTimeout(S.moveTimer); S.moveTimer = setTimeout(() => { box.hidden = true; }, 15000);
+      if(S.view === "job") refreshPreview();
+    }
+    S.moveSeen = mv.id;
+  }
+  if(!mv && S.moveSeen === undefined) S.moveSeen = null;
   const jobs = S.status && S.status.vinyl ? S.status.vinyl.jobs : -1;
   if(jobs !== S.vjobs){ const first = S.vjobs === -1; S.vjobs = jobs; if(!first && S.view === "job") refreshPreview(); }
   paint();
@@ -3339,7 +3363,10 @@ $("vwidth").onclick = async () => {
   catch(e){ alert(e.message); }
 };
 $("vnew").onclick = async () => {
-  if(!confirm("Clear sheet memory? This forgets where earlier jobs were cut on this sheet. Do it after loading new vinyl or setting a new start point on the plotter.")) return;
+  const talks = S.status && S.status.port && S.status.port.answers;
+  if(!confirm("Clear sheet memory? zombiePlot forgets where earlier jobs were cut. Do it after loading new vinyl." +
+              (talks ? " You don't need to after pressing ORIGIN: the plotter reports that, and zombiePlot keeps track."
+                     : " Also do it after pressing ORIGIN on the plotter: over this cable zombiePlot can't see that."))) return;
   try { await post("/api/session/new"); await poll(); if(S.view === "job"){ S.place = "auto"; refreshPreview(); } } catch(e){ alert(e.message); }
 };
 $("vundo").onclick = async () => {
@@ -3792,7 +3819,7 @@ async function refreshPreview(){
       t += "<br>All: <b>" + num(p.job_w) + " &times; " + num(p.job_h) + u + "</b> (" + how + ")";
     }
     var along = p.base[1], across = p.far ? p.vinyl_width - p.base[0] - p.job_w : p.base[0];
-    t += "<br>" + (p.place === "knife" && p.knife ? "Corner at the knife: " + len(p.knife[0]) + " across, " + len(p.knife[1]) + " along"
+    t += "<br>" + (p.place === "knife" && p.knife ? (p.origin_row === "back" ? "Back " : "Front ") + p.origin_side + " corner at the knife"
                  : (along < 0.05 && across < 0.05) ? (p.far ? "At the right-hand corner" : "At the start point")
                  : len(across) + " across" + (p.far ? " from the right" : "") + ", " + len(along) + " along");
     $("dims").innerHTML = t;
@@ -3930,6 +3957,16 @@ async function poll(){
     if(!S.loadedVersion) S.loadedVersion = S.status.version;
     else if(S.status.version !== S.loadedVersion){ location.reload(); return; }   /* the box was updated */
   }
+  var mv = S.status && S.status.vinyl && S.status.vinyl.moved;
+  if(mv && mv.id !== S.moveSeen){
+    if(S.moveSeen !== undefined || mv.age < 120){
+      toast("Start point moved " + len(mv.across) + " across, " + len(mv.along) + " along. Sheet memory moved to match." +
+                      (mv.dropped ? " " + mv.dropped + " old job" + (mv.dropped === 1 ? "" : "s") + " now outside the cutting area." : ""), true);
+      if(S.view === "job") refreshPreview();
+    }
+    S.moveSeen = mv.id;
+  }
+  if(!mv && S.moveSeen === undefined) S.moveSeen = null;
   var j = S.status && S.status.job;
   if(j){
     var was = S.jobState; S.jobState = j.state;
