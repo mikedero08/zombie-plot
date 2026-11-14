@@ -40,7 +40,7 @@ except ImportError:       # Windows: only --car-thing-install is meant to run th
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "2.2"
+VERSION = "3.0"
 UNITS_PER_MM = 40.0          # CAMM-GL III step = 0.025 mm
 FLATTEN_TOL_MM = 0.03        # curve-to-line tolerance (about one cutter step)
 MAX_UPLOAD = 25 * 1024 * 1024
@@ -72,6 +72,8 @@ DEFAULTS = {
     "init": "IN;PA;",
     "auto_update": False,
     "thing_sleep_min": 5,      # Car Thing screen goes dark after this many idle minutes (0 = never)
+    "progress_style": "arm",   # arm (the zombie arm) | classic (a plain bar)
+    "chime": True,             # pages that are open chime when a cut finishes
     "pin_hash": "",            # set through /api/pin only
     "steps_per_mm": 40.0,      # plotter units per mm (HP-GL / Roland CAMM-GL: 40)
 }
@@ -140,6 +142,8 @@ VALIDATORS = {
     "init": _init,
     "auto_update": _bool,
     "thing_sleep_min": lambda v: int(_num(0, 240)(v)),
+    "progress_style": _choice("arm", "classic"),
+    "chime": _bool,
     "pin_hash": lambda v: str(v) if re.match(r"^(|pbkdf2\$\d+\$[0-9a-f]+\$[0-9a-f]+)$", str(v)) else _raise(),
 }
 
@@ -833,10 +837,12 @@ def setup_layouts():
     return out
 
 
-def build_hpgl(polys, offsets, job_w, job_h, cfg, base=(0.0, 0.0), park=None):
+def build_hpgl(polys, offsets, job_w, job_h, cfg, base=(0.0, 0.0), park=None, marks=None):
     """polys: one copy, already oriented. base: where the job's corner goes, in mm from
     the plotter's origin (across, along). park: where to leave the knife afterwards.
-    Returns bytes ready to send."""
+    marks: a dict to fill with byte positions, for showing what has been cut so far:
+    copy_starts, copy_ends (one per copy) and path_ends (the first copy's paths, in cutting
+    order). Returns bytes ready to send."""
     swap, mc, mf = machine_flags(cfg)
     upm = cfg.get("steps_per_mm", UNITS_PER_MM)
     bx, by = base
@@ -851,7 +857,10 @@ def build_hpgl(polys, offsets, job_w, job_h, cfg, base=(0.0, 0.0), park=None):
 
     ordered = order_polys(polys)
     out = [cfg["init"]]
-    for ox, oy in offsets:
+    size = len(cfg["init"])
+    starts, ends, path_ends = [], [], []
+    for k, (ox, oy) in enumerate(offsets):
+        starts.append(size)
         for pts, closed in ordered:
             seq = close_ring(pts, cfg["overcut_mm"]) if closed else pts
             last = None
@@ -861,10 +870,15 @@ def build_hpgl(polys, offsets, job_w, job_h, cfg, base=(0.0, 0.0), park=None):
                 if p != last:
                     steps.append(p)
                     last = p
-            if len(steps) < 2:
-                continue
-            out.append("PU%d,%d;" % steps[0])
-            out.extend("PD%d,%d;" % p for p in steps[1:])
+            if len(steps) >= 2:
+                piece = ["PU%d,%d;" % steps[0]] + ["PD%d,%d;" % p for p in steps[1:]]
+                out.extend(piece)
+                size += sum(len(c) for c in piece)
+            if k == 0:
+                path_ends.append(size)
+        ends.append(size)
+    if marks is not None:
+        marks.update(copy_starts=starts, copy_ends=ends, path_ends=path_ends, ordered=ordered)
     if park is None:
         park = (0.0, by + job_h + cfg["advance_mm"]) if cfg["end_action"] == "advance" else (0.0, 0.0)
     u, v = int(round(park[0] * upm)), int(round(park[1] * upm))
@@ -913,7 +927,18 @@ NO_ADAPTER = "No plotter cable found. Check that the plotter's USB cable is plug
 LPGETSTATUS = 0x060b
 LP_PERRORP, LP_PSELECD, LP_POUTPA = 0x08, 0x10, 0x20
 PARALLEL_PATTERNS = ("/dev/usb/lp*", "/dev/lp[0-9]*")
-SERIAL_PATTERNS = ("/dev/serial/by-id/*", "/dev/ttyUSB*", "/dev/ttyACM*")
+SERIAL_PATTERNS = ("/dev/serial/by-id/*", "/dev/ttyUSB*", "/dev/serial0", "/dev/ttyACM*")
+
+
+def _console_port(path):
+    """True when the Pi uses this serial port for its login console (then it is not the plotter's)."""
+    try:
+        with open("/proc/cmdline", "r", encoding="utf-8") as f:
+            cmd = f.read()
+    except OSError:
+        return False
+    names = {os.path.basename(path), os.path.basename(os.path.realpath(path))}
+    return any(("console=%s" % n) in cmd for n in names)
 
 # Two-way serial. Device-control queries (ESC.B) are answered at once; HP-GL output
 # instructions (OI, OH, OE) are answered when the plotter reaches them in its buffer, and a
@@ -985,7 +1010,8 @@ class Port:
         else:
             patterns = PARALLEL_PATTERNS + SERIAL_PATTERNS
         for pattern in patterns:
-            found = sorted(glob.glob(pattern))
+            found = [f for f in sorted(glob.glob(pattern))
+                     if not (pattern == "/dev/serial0" and _console_port(f))]
             if found:
                 return found[0]
         return None
@@ -1249,6 +1275,44 @@ class Port:
         upm = self.cfg.get("steps_per_mm") or UNITS_PER_MM
         a, b = (y, x) if self.cfg.get("swap_axes") else (x, y)
         return a / upm, b / upm
+
+    def jog(self, da, db):
+        """Move the knife, raised, by (across, along) mm. Stays inside the cutting area the plotter
+        reports. Returns the new position, (across, along) in mm from the plotter's start point."""
+        if not self.qlock.acquire(timeout=3):
+            raise PortError("The plotter is busy. Try again when the cut has finished.")
+        try:
+            with self.lock:
+                fd = self._open()
+                if self.is_parallel():
+                    raise PortError("Moving the knife needs a serial cable. A parallel cable only sends.")
+            if not self.talk["ever"]:
+                raise PortError("The plotter is not answering zombiePlot, so the knife cannot be moved from here.")
+            self._pending_settled(fd, 0.5)
+            if self.pending:
+                raise PortError("The plotter has not answered an earlier question yet. Check it is online "
+                                "(not paused or in a menu), then try again.")
+            v = self._ask(fd, b"OA;", _p_pos, 2.0, hpgl=True)
+            if v is None:
+                raise PortError("The plotter did not report the knife position. Check it is online, then try again.")
+            a, b = self.to_vinyl(*v)
+            a, b = a + da, b + db
+            c = self.talk["clip"]
+            if c:
+                x1, y1 = self.to_vinyl(c[0], c[1])
+                x2, y2 = self.to_vinyl(c[2], c[3])
+                a = max(min(x1, x2), min(max(x1, x2), a))
+                b = max(min(y1, y2), min(max(y1, y2), b))
+            upm = self.cfg.get("steps_per_mm") or UNITS_PER_MM
+            u, w = int(round(a * upm)), int(round(b * upm))
+            self._write_all(fd, ("PA;PU%d,%d;" % ((w, u) if self.cfg.get("swap_axes") else (u, w))).encode())
+            return a, b
+        except OSError as e:
+            with self.lock:
+                self._close()
+            raise PortError("Lost the plotter cable (%s)." % e.strerror)
+        finally:
+            self.qlock.release()
 
     def knife(self):
         """Where the knife is now, (across, along) in mm from the start point, read from the plotter."""
@@ -1670,6 +1734,9 @@ class Jobs:
         self.waiting = False
         self.tracked = False     # True when the plotter itself reports how far the cut has got
         self.message = ""
+        self.seq = 0             # counts jobs, so pages can tell one job from the next
+        self.started = 0.0
+        self.on_end = None       # called as on_end(state, message, sent, total) when a job ends
 
     def busy(self):
         return self.state in ("sending", "stopping")
@@ -1681,6 +1748,8 @@ class Jobs:
             self.stop.clear()
             self.state, self.name, self.total, self.sent = "sending", name, len(data), 0
             self.waiting, self.message, self.tracked = False, "", False
+            self.seq += 1
+            self.started = time.time()
         threading.Thread(target=self._run, args=(data,), daemon=True).start()
 
     def _progress(self, sent, waiting, tracked=False):
@@ -1706,6 +1775,11 @@ class Jobs:
             state, msg = "error", "Unexpected error: %s" % e
         with self.lock:
             self.state, self.message, self.waiting = state, msg, False
+        if self.on_end:
+            try:
+                self.on_end(state, msg, self.sent, self.total)
+            except Exception as e:
+                sys.stderr.write("zombiePlot: job end hook: %s\n" % e)
 
     def request_stop(self):
         with self.lock:
@@ -1726,7 +1800,7 @@ class Jobs:
         with self.lock:
             return {"state": self.state, "name": self.name, "total": self.total,
                     "sent": self.sent, "waiting": self.waiting, "message": self.message,
-                    "tracked": self.tracked}
+                    "tracked": self.tracked, "seq": self.seq, "started": self.started}
 
 
 # ----------------------------------------------------------------------------
@@ -1747,6 +1821,7 @@ class Session:
         self.group = 0
         self.clip = None          # the plotter's cutting area last seen, to notice ORIGIN being pressed
         self.moved = None         # the last time the start point moved, to tell the user once
+        self.offset = [0.0, 0.0]  # start point set from the app, (across, along) mm from the plotter's own
         try:
             with open(path, "r", encoding="utf-8") as f:
                 d = json.load(f)
@@ -1754,13 +1829,16 @@ class Session:
             self.group = int(d.get("group", 0))
             c = d.get("clip")
             self.clip = [int(v) for v in c] if isinstance(c, list) and len(c) == 4 else None
+            o = d.get("offset")
+            if isinstance(o, list) and len(o) == 2:
+                self.offset = [float(o[0]), float(o[1])]
         except (OSError, ValueError, TypeError, AttributeError):
             pass
 
     def _save(self):
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"items": self.items, "group": self.group, "clip": self.clip}, f)
+            json.dump({"items": self.items, "group": self.group, "clip": self.clip, "offset": self.offset}, f)
         os.replace(tmp, self.path)
 
     def follow(self, clip, to_vinyl):
@@ -1774,19 +1852,46 @@ class Session:
                 return False
             if old and (old[2] - old[0], old[3] - old[1]) == (clip[2] - clip[0], clip[3] - clip[1]):
                 da, db = to_vinyl(old[0] - clip[0], old[1] - clip[1])
-                jobs_before = len({i["group"] for i in self.items})
-                for i in self.items:
-                    i["x"] -= da
-                    i["y"] -= db
-                # forget areas now wholly outside the cutting area: the plotter only cuts forward
-                # from its start point, so nothing new can ever land on them
-                self.items = [i for i in self.items if i["x"] + i["w"] > 0 and i["y"] + i["h"] > 0]
-                self.moved = {"id": time.time(), "across": abs(da), "along": abs(db),
-                              "dropped": jobs_before - len({i["group"] for i in self.items})}
+                # a start point set from the app was measured from the old one: go back to the plotter's
+                had = self.offset != [0.0, 0.0]
+                oa, ob = self.offset
+                self.offset = [0.0, 0.0]
+                dropped = self._shift(da - oa, db - ob)
+                self.moved = {"id": time.time(), "across": abs(da), "along": abs(db), "dropped": dropped,
+                              "kind": "origin", "cleared": had}
                 moved = True
             self.clip = clip
             self._save()
             return moved
+
+    def _shift(self, da, db):
+        """Remembered areas move by (-da, -db). Areas left wholly behind the start point are
+        forgotten: the plotter only cuts forward from it, so nothing new can land on them.
+        Returns how many jobs were forgotten. Call with the lock held."""
+        before = len({i["group"] for i in self.items})
+        for i in self.items:
+            i["x"] -= da
+            i["y"] -= db
+        self.items = [i for i in self.items if i["x"] + i["w"] > 0 and i["y"] + i["h"] > 0]
+        return before - len({i["group"] for i in self.items})
+
+    def set_start(self, da, db):
+        """Start point set at the knife: (da, db) mm from the current one."""
+        with self.lock:
+            dropped = self._shift(da, db)
+            self.offset = [self.offset[0] + da, self.offset[1] + db]
+            self.moved = {"id": time.time(), "across": abs(da), "along": abs(db), "dropped": dropped, "kind": "set"}
+            self._save()
+
+    def clear_start(self):
+        with self.lock:
+            oa, ob = self.offset
+            if [oa, ob] == [0.0, 0.0]:
+                return
+            self._shift(-oa, -ob)
+            self.offset = [0.0, 0.0]
+            self.moved = {"id": time.time(), "across": abs(oa), "along": abs(ob), "dropped": 0, "kind": "clear"}
+            self._save()
 
     def rects(self):
         with self.lock:
@@ -1798,7 +1903,7 @@ class Session:
         used = max([0.0] + [i["y"] + i["h"] for i in items])
         jobs = len({i["group"] for i in items})
         mv = dict(self.moved, age=time.time() - self.moved["id"]) if self.moved else None
-        return {"items": items, "used_mm": used, "jobs": jobs, "moved": mv}
+        return {"items": items, "used_mm": used, "jobs": jobs, "moved": mv, "offset": list(self.offset)}
 
     def add(self, rects, name):
         with self.lock:
@@ -1840,6 +1945,17 @@ class App:
         self.cache_lock = threading.Lock()
         self.applied_width = None          # last width taken from the plotter
         self.knife_at = None               # (across, along) last read from the plotter, for "At the knife"
+        self.live = None                   # the running job's shape and byte marks, for the live cut view
+        self.history_path = os.path.join(data_dir, "history.json")
+        self.history_lock = threading.Lock()
+        try:
+            with open(self.history_path, "r", encoding="utf-8") as f:
+                self.history = [h for h in json.load(f) if isinstance(h, dict)][:60]
+        except (OSError, ValueError, TypeError):
+            self.history = []
+        self.thumbs = {}
+        self.thumb_lock = threading.Lock()
+        self.jobs.on_end = self._job_ended
         self.diag_lock = threading.Lock()
         self.diag_state = {"state": "idle", "test": "", "log": [], "message": "", "started": 0}
         self.diag_stop = threading.Event()
@@ -1909,9 +2025,17 @@ class App:
         if c and self.session.follow(c, self.port.to_vinyl):
             self.knife_at = None           # measured from the old start point
 
+    def plotter_width(self):
+        """Width the plotter can cut from the current start point (the app's start point, if set)."""
+        w = self.port.width_mm()
+        if not w:
+            return None
+        w = round(w - self.session.offset[0], 2)
+        return w if 20 <= w <= 3000 else None
+
     def take_width(self):
         """Use the width the plotter reports, each time it reports a new one (new vinyl loaded)."""
-        w = self.port.width_mm()
+        w = self.plotter_width()
         if not w or not self.cfg.get("auto_width"):
             return
         if self.applied_width is not None and abs(w - self.applied_width) < 0.5:
@@ -1921,7 +2045,7 @@ class App:
             self.cfg.update({"vinyl_width_mm": w})
 
     def width_from_plotter(self):
-        w = self.port.width_mm()
+        w = self.plotter_width()
         return bool(w and self.cfg.get("auto_width") and abs(self.cfg.get("vinyl_width_mm") - w) < 0.5)
 
     # ---- files ----
@@ -2094,7 +2218,7 @@ class App:
         if place == "knife":
             try:
                 if q.get("reread") or self.knife_at is None:
-                    self.knife_at = self.port.knife()
+                    self.knife_at = self.knife()
                 knife = self.knife_at
             except PortError as e:
                 self.knife_at = None
@@ -2170,16 +2294,141 @@ class App:
         st = self.port.status()
         if st["state"] == "missing":
             raise UserError(st["message"])
-        data = build_hpgl(p["polys"], p["offsets"], p["job_w"], p["job_h"], p["cfg"],
-                          base=p["base"], park=p["park"])
+        cfg = p["cfg"]
+        # The start point set from the app (if any) moves the whole job, including where it parks.
+        oa, ob = (0.0, 0.0) if p["setup"] else self.session.offset
+        bx, by = p["base"]
+        park = p["park"]
+        if park is None:
+            park = (0.0, by + p["job_h"] + cfg["advance_mm"]) if cfg["end_action"] == "advance" else (0.0, 0.0)
+        marks = {}
+        data = build_hpgl(p["polys"], p["offsets"], p["job_w"], p["job_h"], cfg,
+                          base=(bx + oa, by + ob), park=(park[0] + oa, park[1] + ob), marks=marks)
         try:
             self.jobs.start(p["name"], data)
         except PortError as e:
             raise UserError(str(e))
+        eps = max(p["w"], p["h"]) / 600.0
+        self.live = {"seq": self.jobs.seq, "rects": p["rects"], "total": len(data),
+                     "copy_starts": marks["copy_starts"], "copy_ends": marks["copy_ends"],
+                     "path_ends": marks["path_ends"],
+                     "paths": [preview_path([poly], eps) for poly in marks["ordered"]],
+                     "starts": [[round(poly[0][0][0], 2), round(poly[0][0][1], 2)] for poly in marks["ordered"]],
+                     "w": p["w"], "h": p["h"]}
         if not p["setup"]:
             self.session.add(p["rects"], p["name"])
+        if q.get("id") != "test" and not p["setup"]:
+            self.add_history({"t": time.time(), "seq": self.jobs.seq, "id": q.get("id"), "name": p["name"],
+                              "rot": p["rot"], "mirror": p["mirror"], "copies": p["copies"], "layout": p["layout"],
+                              "w": p["job_w"], "h": p["job_h"], "state": "sending", "pct": 0})
         self.knife_at = None               # the knife moves during the cut: read it again next time
-        return {"bytes": len(data), "seconds": len(data) * 10.0 / p["cfg"]["baud"]}
+        return {"bytes": len(data), "seconds": len(data) * 10.0 / cfg["baud"], "seq": self.jobs.seq}
+
+    # ---- history ----
+
+    def add_history(self, entry):
+        with self.history_lock:
+            self.history.insert(0, entry)
+            del self.history[60:]
+            self._save_history()
+
+    def _save_history(self):
+        tmp = self.history_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.history, f)
+            os.replace(tmp, self.history_path)
+        except OSError:
+            pass
+
+    def _job_ended(self, state, message, sent, total):
+        seq = self.jobs.seq
+        with self.history_lock:
+            for h in self.history:
+                if h.get("seq") == seq and h.get("state") == "sending":
+                    h["state"] = state
+                    h["pct"] = 100 if state == "done" else int(100 * sent / max(1, total))
+                    h["end"] = time.time()
+                    self._save_history()
+                    break
+
+    def history_list(self):
+        with self.history_lock:
+            return [dict(h) for h in self.history]
+
+    # ---- the knife and the start point ----
+
+    def knife(self):
+        a, b = self.port.knife()
+        oa, ob = self.session.offset
+        return round(a - oa, 2), round(b - ob, 2)
+
+    def jog(self, da, db):
+        if self.jobs.busy() or self.diag_running():
+            raise UserError("Wait until the plotter has finished.")
+        try:
+            da, db = float(da), float(db)
+        except (TypeError, ValueError):
+            raise UserError("Bad move.")
+        if not (abs(da) <= 500 and abs(db) <= 500):
+            raise UserError("That move is too far.")
+        try:
+            a, b = self.port.jog(da, db)
+        except PortError as e:
+            raise UserError(str(e))
+        self.knife_at = None
+        oa, ob = self.session.offset
+        return {"across": round(a - oa, 2), "along": round(b - ob, 2)}
+
+    def set_start_here(self):
+        if self.jobs.busy():
+            raise UserError("Wait until the plotter has finished.")
+        try:
+            a, b = self.knife()
+        except PortError as e:
+            raise UserError(str(e))
+        self.session.set_start(a, b)
+        self.knife_at = None
+        self.applied_width = None
+        self.take_width()
+        return {"offset": list(self.session.offset)}
+
+    def clear_start(self):
+        self.session.clear_start()
+        self.knife_at = None
+        self.applied_width = None
+        self.take_width()
+        return {"offset": list(self.session.offset)}
+
+    # ---- small pictures for the file list ----
+
+    def thumb(self, file_id):
+        if file_id == "test":
+            polys, w, h = test_design()
+            return {"d": preview_path(polys, max(w, h) / 80.0), "w": w, "h": h}
+        try:
+            full = self.resolve(file_id)
+            st = os.stat(full)
+        except (UserError, OSError):
+            return {"d": "", "w": 1, "h": 1}      # gone (deleted a moment ago) or not a file: no picture
+        key = (full, st.st_mtime_ns, st.st_size)
+        with self.thumb_lock:
+            hit = self.thumbs.get(key)
+        if hit is None:
+            if st.st_size > 3 * 1024 * 1024:
+                hit = {"d": "", "w": 1, "h": 1}
+            else:
+                try:
+                    with open(full, "rb") as f:
+                        polys, w, h, _ = parse_svg(f.read(), self.cfg.get("px_per_inch"))
+                    hit = {"d": preview_path(polys, max(w, h) / 80.0), "w": w, "h": h}
+                except (OSError, SvgError):
+                    hit = {"d": "", "w": 1, "h": 1}
+            with self.thumb_lock:
+                if len(self.thumbs) > 500:
+                    self.thumbs.clear()
+                self.thumbs[key] = hit
+        return hit
 
     def update_info(self):
         st = self.updates.load()
@@ -2221,11 +2470,12 @@ class App:
         return {"port": self.port.status(), "job": self.jobs.snapshot(), "version": VERSION,
                 "update": up if up and parse_version(up) > parse_version(VERSION) else None,
                 "vinyl": {"width_mm": min(self.cfg.get("vinyl_width_mm"), self.cfg.get("cut_width_mm")),
-                          "from_plotter": self.width_from_plotter(),
+                          "from_plotter": self.width_from_plotter(), "offset": ses["offset"],
                           "used_mm": ses["used_mm"], "jobs": ses["jobs"], "moved": ses["moved"],
                           "units": self.cfg.get("units"), "start_corner": self.cfg.get("start_corner"),
                           "origin_side": origin_side(self.cfg.snapshot()), "origin_row": origin_row(self.cfg.snapshot())},
-                "thing_sleep_min": self.cfg.get("thing_sleep_min")}
+                "thing_sleep_min": self.cfg.get("thing_sleep_min"),
+                "progress_style": self.cfg.get("progress_style"), "chime": self.cfg.get("chime")}
 
 
 def fmt_len(mm, cfg):
@@ -2660,6 +2910,18 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(app.update_info())
                 if path == "/api/diag":
                     return self._json(app.diag_info())
+                if path == "/api/history":
+                    return self._json({"history": app.history_list()})
+                if path == "/api/thumb":
+                    return self._json(dict(app.thumb(q.get("id")), ok=True))
+                if path == "/api/job/live":
+                    return self._json({"live": app.live})
+                if path == "/api/knife":
+                    try:
+                        a, b = app.knife()
+                    except PortError as e:
+                        raise UserError(str(e))
+                    return self._json({"ok": True, "across": a, "along": b})
                 if path == "/api/settings":
                     snap = app.cfg.snapshot()
                     snap.pop("pin_hash", None)
@@ -2702,6 +2964,12 @@ class Handler(BaseHTTPRequestHandler):
                         return self._json({"ok": True})
                     app.jobs.request_stop()
                     return self._json({"ok": True})
+                if path == "/api/jog":
+                    return self._json(dict(app.jog(body.get("across", 0), body.get("along", 0)), ok=True))
+                if path == "/api/start/set":
+                    return self._json(dict(app.set_start_here(), ok=True))
+                if path == "/api/start/clear":
+                    return self._json(dict(app.clear_start(), ok=True))
                 if path == "/api/diag/run":
                     return self._json(dict(app.diag_run(body.get("test")), ok=True))
                 if path == "/api/diag/mark":
@@ -2755,6 +3023,51 @@ ICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96"><rect width
 # pixel zombie mascot, 16 x 18, two walking frames swapped by CSS. Used on both pages.
 LOGO_SVG = '<svg class="logo" viewBox="1.46 1.82 6.09 1.36" role="img" aria-label="zombiePLOT"><path fill="var(--go)" fill-rule="evenodd" d="M 1.536952,2.821760 C 1.534000,2.821760 1.531417,2.820653 1.529203,2.818439 C 1.526989,2.816225 1.525882,2.813273 1.525882,2.809583 L 1.526989,2.785229 C 1.526989,2.765302 1.524775,2.745745 1.520347,2.726557 C 1.518871,2.715487 1.517395,2.704786 1.515919,2.694454 C 1.514443,2.684122 1.510384,2.675450 1.503742,2.668439 C 1.497100,2.661428 1.493779,2.652756 1.493779,2.642424 L 1.494886,2.615856 C 1.494886,2.599620 1.494148,2.584491 1.492672,2.570469 C 1.491196,2.560136 1.490089,2.548697 1.489351,2.536151 C 1.489351,2.519177 1.492856,2.503679 1.499868,2.489657 C 1.506879,2.475635 1.514812,2.462350 1.523668,2.449804 L 1.579019,2.364564 C 1.614443,2.310690 1.648207,2.257553 1.680310,2.205155 C 1.712414,2.152756 1.733262,2.111797 1.742856,2.082277 L 1.742856,2.074528 C 1.742856,2.064933 1.739166,2.055893 1.731786,2.047406 C 1.724406,2.038919 1.715919,2.034675 1.706325,2.034675 L 1.688613,2.034675 L 1.622192,2.032461 C 1.603004,2.032461 1.586399,2.036336 1.572377,2.044085 C 1.558355,2.051834 1.551159,2.068439 1.550790,2.093900 C 1.550421,2.119362 1.549683,2.139103 1.548576,2.153125 C 1.547469,2.167147 1.545993,2.177111 1.544148,2.183015 C 1.542303,2.188919 1.540458,2.192793 1.538613,2.194638 C 1.536768,2.196483 1.534369,2.197406 1.531417,2.197406 C 1.525513,2.197406 1.521639,2.194269 1.519794,2.187996 C 1.517949,2.181723 1.517026,2.173421 1.517026,2.163088 L 1.518133,2.128771 C 1.518133,2.108107 1.515550,2.085598 1.510384,2.061243 C 1.508908,2.055339 1.507248,2.043900 1.505403,2.026926 C 1.503558,2.009952 1.501897,1.991686 1.500421,1.972129 C 1.498945,1.952572 1.498207,1.936520 1.498207,1.923974 C 1.498945,1.898144 1.505403,1.880985 1.517580,1.872498 C 1.529757,1.864011 1.548761,1.859767 1.574591,1.859767 L 1.645439,1.861981 C 1.663152,1.861243 1.679388,1.860321 1.694148,1.859214 C 1.708908,1.858107 1.725144,1.857553 1.742856,1.857553 L 1.780495,1.857553 C 1.810753,1.857553 1.835107,1.856815 1.853558,1.855339 L 1.887875,1.854232 C 1.910753,1.854232 1.930310,1.859767 1.946546,1.870838 C 1.950237,1.873790 1.952635,1.877295 1.953742,1.881354 C 1.954849,1.885413 1.956510,1.888550 1.958724,1.890764 C 1.968318,1.901096 1.974775,1.912535 1.978096,1.925081 C 1.981417,1.937627 1.983816,1.950173 1.985292,1.962719 C 1.986030,1.971576 1.987137,1.979878 1.988613,1.987627 C 1.990089,1.995376 1.990827,2.002941 1.990827,2.010321 C 1.990827,2.024343 1.989351,2.038365 1.986399,2.052387 C 1.982709,2.072314 1.980864,2.092240 1.980864,2.112166 L 1.981971,2.163088 C 1.981971,2.175635 1.980864,2.187996 1.978650,2.200173 C 1.976436,2.212350 1.975329,2.224712 1.975329,2.237258 L 1.975329,2.250542 C 1.975329,2.253494 1.974406,2.255893 1.972561,2.257738 C 1.970716,2.259583 1.968318,2.260505 1.965366,2.260505 C 1.959462,2.260505 1.956510,2.256446 1.956510,2.248328 C 1.955034,2.226926 1.951713,2.205524 1.946546,2.184122 C 1.943594,2.167147 1.941011,2.149435 1.938797,2.130985 C 1.938797,2.128033 1.937690,2.125819 1.935476,2.124343 C 1.911122,2.150173 1.891196,2.179325 1.875698,2.211797 C 1.870532,2.222129 1.864628,2.231170 1.857986,2.238919 C 1.851344,2.246668 1.845439,2.254601 1.840273,2.262719 C 1.835845,2.273052 1.797838,2.336889 1.726251,2.454232 L 1.724037,2.457553 C 1.720347,2.462719 1.718502,2.466778 1.718502,2.469731 C 1.718502,2.473421 1.720716,2.476742 1.725144,2.479694 C 1.729572,2.482646 1.734369,2.484122 1.739535,2.484122 L 1.770532,2.483015 L 1.833631,2.484122 C 1.853558,2.484122 1.866842,2.483384 1.873484,2.481908 L 1.883447,2.480801 C 1.902635,2.480801 1.921270,2.485044 1.939351,2.493531 C 1.957432,2.502018 1.966473,2.517701 1.966473,2.540579 C 1.966473,2.549435 1.965919,2.557922 1.964812,2.566040 C 1.963705,2.574159 1.963152,2.581908 1.963152,2.589288 L 1.964259,2.613642 C 1.964259,2.630616 1.961676,2.650911 1.956510,2.674528 C 1.951344,2.698144 1.948761,2.721022 1.948761,2.743162 L 1.949868,2.764195 C 1.949868,2.776742 1.944332,2.783753 1.933262,2.785229 C 1.928834,2.785229 1.925698,2.782277 1.923853,2.776373 C 1.922008,2.770469 1.919240,2.756815 1.915550,2.735413 C 1.907432,2.708845 1.892672,2.687812 1.871270,2.672314 C 1.869056,2.670100 1.866842,2.668992 1.864628,2.668992 L 1.842487,2.671207 C 1.835845,2.671207 1.829019,2.670838 1.822008,2.670100 C 1.814997,2.669362 1.807801,2.668992 1.800421,2.668992 C 1.791565,2.668992 1.782524,2.669731 1.773299,2.671207 C 1.764074,2.672683 1.754665,2.673421 1.745070,2.673421 C 1.730310,2.673421 1.717026,2.672867 1.705218,2.671760 C 1.693410,2.670653 1.681233,2.669731 1.668687,2.668992 C 1.656879,2.668992 1.645255,2.669731 1.633816,2.671207 C 1.622377,2.672683 1.611122,2.673421 1.600052,2.673421 L 1.580126,2.672314 L 1.572377,2.671207 C 1.563521,2.671207 1.558724,2.682646 1.557986,2.705524 L 1.556879,2.734306 C 1.556879,2.755708 1.554665,2.778218 1.550237,2.801834 L 1.548022,2.809583 C 1.545070,2.817701 1.541380,2.821760 1.536952,2.821760 M 2.504480,2.903679 C 2.491934,2.902203 2.485661,2.873052 2.485661,2.816225 L 2.486768,2.736520 C 2.486768,2.706262 2.485107,2.679878 2.481786,2.657369 C 2.478465,2.634860 2.470163,2.623605 2.456879,2.623605 C 2.450975,2.623605 2.443594,2.627111 2.434738,2.634122 C 2.425882,2.641133 2.413521,2.647221 2.397653,2.652387 C 2.381786,2.657553 2.354665,2.660136 2.316288,2.660136 C 2.268318,2.656446 2.234369,2.649066 2.214443,2.637996 C 2.203373,2.631354 2.194517,2.628033 2.187875,2.628033 C 2.179019,2.628033 2.173115,2.637258 2.170163,2.655708 L 2.165735,2.682277 C 2.159831,2.703679 2.156879,2.725450 2.156879,2.747590 L 2.157986,2.756446 C 2.155772,2.771207 2.150237,2.778587 2.141380,2.778587 C 2.135476,2.778587 2.129757,2.774897 2.124222,2.767516 C 2.118687,2.760136 2.115919,2.748697 2.115919,2.733199 L 2.117026,2.715487 C 2.117026,2.659398 2.107063,2.587074 2.087137,2.498513 L 2.076067,2.449804 C 2.070901,2.423236 2.067580,2.404417 2.066104,2.393347 C 2.064628,2.382277 2.063521,2.375819 2.062783,2.373974 C 2.062045,2.372129 2.060938,2.371207 2.059462,2.371207 C 2.043225,2.371207 2.035107,2.359398 2.035107,2.335782 C 2.035107,2.318070 2.038244,2.295930 2.044517,2.269362 C 2.050790,2.242793 2.058170,2.213826 2.066657,2.182461 C 2.075144,2.151096 2.083447,2.118808 2.091565,2.085598 C 2.093779,2.078218 2.098576,2.065856 2.105956,2.048513 C 2.113336,2.031170 2.122008,2.012904 2.131971,1.993716 C 2.141934,1.974528 2.152451,1.958660 2.163521,1.946114 C 2.198207,1.907738 2.230126,1.884860 2.259277,1.877480 C 2.288428,1.870100 2.316288,1.866409 2.342856,1.866409 L 2.381602,1.866409 C 2.400790,1.866409 2.423668,1.874897 2.450237,1.891871 C 2.476805,1.908845 2.497100,1.926188 2.511122,1.943900 C 2.536952,1.974897 2.558355,2.018254 2.575329,2.073974 C 2.592303,2.129694 2.600790,2.192978 2.600790,2.263826 C 2.600790,2.321391 2.593410,2.382646 2.578650,2.447590 C 2.577912,2.452756 2.577543,2.460690 2.577543,2.471391 C 2.577543,2.482092 2.577174,2.492978 2.576436,2.504048 C 2.575698,2.515118 2.574037,2.524712 2.571454,2.532830 C 2.568871,2.540948 2.564259,2.545007 2.557617,2.545007 C 2.554665,2.545007 2.552082,2.544454 2.549868,2.543347 C 2.547653,2.542240 2.545070,2.541317 2.542118,2.540579 C 2.540642,2.540579 2.539535,2.541133 2.538797,2.542240 C 2.538059,2.543347 2.537690,2.544454 2.537690,2.545561 C 2.537690,2.546668 2.537321,2.547590 2.536583,2.548328 C 2.528465,2.577849 2.524406,2.602203 2.524406,2.621391 C 2.523668,2.660505 2.522561,2.697221 2.521085,2.731539 C 2.519609,2.765856 2.518871,2.799620 2.518871,2.832830 L 2.519978,2.880432 C 2.519978,2.896668 2.515550,2.904786 2.506694,2.904786 L 2.504480,2.903679 M 2.317395,2.489657 C 2.333631,2.489657 2.350606,2.480063 2.368318,2.460874 C 2.400052,2.426188 2.415919,2.349435 2.415919,2.230616 C 2.415919,2.173790 2.410015,2.125819 2.398207,2.086705 C 2.395255,2.080063 2.386030,2.071945 2.370532,2.062350 C 2.363890,2.058660 2.357986,2.056815 2.352820,2.056815 C 2.329941,2.063457 2.316104,2.076557 2.311307,2.096114 C 2.306510,2.115671 2.304111,2.135044 2.304111,2.154232 L 2.304111,2.175266 C 2.304111,2.183384 2.303742,2.190764 2.303004,2.197406 C 2.301528,2.207000 2.297100,2.211797 2.289720,2.211797 C 2.282340,2.211797 2.277543,2.208107 2.275329,2.200727 C 2.273115,2.193347 2.272008,2.185598 2.272008,2.177480 C 2.271270,2.164195 2.268687,2.152387 2.264259,2.142055 L 2.257617,2.198513 C 2.256141,2.206631 2.255403,2.214749 2.255403,2.222867 C 2.255403,2.230985 2.255772,2.240764 2.256510,2.252203 C 2.257248,2.263642 2.257617,2.277480 2.257617,2.293716 L 2.262045,2.340210 C 2.262045,2.347590 2.260938,2.354232 2.258724,2.360136 C 2.256510,2.366040 2.255403,2.371207 2.255403,2.375635 C 2.255403,2.383753 2.258355,2.391133 2.264259,2.397775 C 2.267211,2.402941 2.270347,2.409214 2.273668,2.416594 C 2.276989,2.423974 2.278650,2.433937 2.278650,2.446483 C 2.278650,2.459029 2.282709,2.469362 2.290827,2.477480 C 2.298945,2.485598 2.307801,2.489657 2.317395,2.489657 M 2.670532,2.789657 C 2.667580,2.789657 2.664812,2.788550 2.662229,2.786336 C 2.659646,2.784122 2.658355,2.780801 2.658355,2.776373 C 2.652451,2.707738 2.649499,2.658660 2.649499,2.629140 C 2.649499,2.601834 2.652451,2.581170 2.658355,2.567147 C 2.664997,2.549435 2.668318,2.521760 2.668318,2.484122 C 2.668318,2.476742 2.669240,2.467332 2.671085,2.455893 C 2.672930,2.444454 2.673853,2.434306 2.673853,2.425450 C 2.673853,2.411428 2.670163,2.404417 2.662783,2.404417 C 2.650975,2.404417 2.645070,2.397775 2.645070,2.384491 C 2.649499,2.323974 2.659462,2.264564 2.674960,2.206262 L 2.686030,2.164195 C 2.688244,2.153863 2.689351,2.146483 2.689351,2.142055 C 2.687875,2.139103 2.686399,2.136520 2.684923,2.134306 C 2.683447,2.132092 2.682709,2.129140 2.682709,2.125450 C 2.682709,2.121760 2.683262,2.117332 2.684369,2.112166 C 2.685476,2.107000 2.686030,2.100358 2.686030,2.092240 C 2.686030,2.081908 2.683816,2.069731 2.679388,2.055708 C 2.674960,2.041686 2.672746,2.029509 2.672746,2.019177 C 2.672746,2.009583 2.673484,1.999620 2.674960,1.989288 C 2.677912,1.976004 2.679388,1.951280 2.679388,1.915118 C 2.679388,1.885598 2.693041,1.870838 2.720347,1.870838 C 2.740273,1.870838 2.753927,1.870100 2.761307,1.868623 C 2.768687,1.867147 2.777543,1.866040 2.787875,1.865302 C 2.796731,1.865302 2.805772,1.866225 2.814997,1.868070 C 2.824222,1.869915 2.834000,1.870838 2.844332,1.870838 C 2.849499,1.870838 2.852082,1.873790 2.852082,1.879694 C 2.852820,1.879694 2.856325,1.888181 2.862598,1.905155 C 2.868871,1.922129 2.873853,1.939103 2.877543,1.956077 C 2.879757,1.969362 2.883262,1.983384 2.888059,1.998144 C 2.892856,2.012904 2.896731,2.028771 2.899683,2.045745 C 2.901897,2.065671 2.906694,2.084491 2.914074,2.102203 C 2.917026,2.109583 2.918871,2.117147 2.919609,2.124897 C 2.920347,2.132646 2.922008,2.139657 2.924591,2.145930 C 2.927174,2.152203 2.932524,2.155708 2.940642,2.156446 C 2.942856,2.156446 2.944517,2.154970 2.945624,2.152018 C 2.946731,2.149066 2.948022,2.145007 2.949499,2.139841 C 2.952451,2.127295 2.962414,2.094823 2.979388,2.042424 C 2.980864,2.037996 2.981602,2.033937 2.981602,2.030247 C 2.981602,2.024343 2.980495,2.019362 2.978281,2.015302 C 2.976067,2.011243 2.974960,2.007000 2.974960,2.002572 C 2.974960,1.996668 2.977912,1.989288 2.983816,1.980432 C 2.994886,1.959029 3.002266,1.936889 3.005956,1.914011 C 3.006694,1.908107 3.007801,1.902572 3.009277,1.897406 C 3.018871,1.870100 3.035845,1.856446 3.060200,1.856446 C 3.068318,1.857184 3.076251,1.858107 3.084000,1.859214 C 3.091749,1.860321 3.102635,1.860874 3.116657,1.860874 C 3.129203,1.860874 3.139166,1.860136 3.146546,1.858660 C 3.164259,1.858660 3.176620,1.867332 3.183631,1.884675 C 3.190642,1.902018 3.194148,1.921391 3.194148,1.942793 C 3.194148,1.959767 3.193225,1.977111 3.191380,1.994823 C 3.189535,2.012535 3.188613,2.029509 3.188613,2.045745 C 3.188613,2.061981 3.190089,2.076004 3.193041,2.087812 C 3.193041,2.092240 3.192303,2.096299 3.190827,2.099989 C 3.189351,2.103679 3.188613,2.107738 3.188613,2.112166 C 3.191565,2.135782 3.193041,2.164564 3.193041,2.198513 C 3.195255,2.231723 3.198945,2.260136 3.204111,2.283753 C 3.208539,2.302203 3.210753,2.317701 3.210753,2.330247 C 3.210753,2.340579 3.208908,2.348697 3.205218,2.354601 C 3.201528,2.360505 3.199683,2.366409 3.199683,2.372314 L 3.200790,2.386705 C 3.203742,2.395561 3.205218,2.415487 3.205218,2.446483 C 3.205218,2.470838 3.206510,2.489841 3.209093,2.503494 C 3.211676,2.517147 3.214997,2.539841 3.219056,2.571576 C 3.223115,2.603310 3.225144,2.630985 3.225144,2.654601 C 3.225144,2.664933 3.224406,2.673421 3.222930,2.680063 C 3.219978,2.695561 3.217949,2.707922 3.216842,2.717147 C 3.215735,2.726373 3.214443,2.732830 3.212967,2.736520 C 3.211491,2.740210 3.208539,2.742055 3.204111,2.742055 C 3.199683,2.742055 3.196731,2.740948 3.195255,2.738734 C 3.193779,2.736520 3.193041,2.732461 3.193041,2.726557 L 3.194148,2.708845 C 3.194148,2.662350 3.183447,2.639103 3.162045,2.639103 L 3.142118,2.640210 C 3.128096,2.640210 3.116842,2.639841 3.108355,2.639103 C 3.099868,2.638365 3.093041,2.637996 3.087875,2.637996 C 3.079019,2.637996 3.072377,2.639472 3.067949,2.642424 C 3.063521,2.645376 3.060200,2.650911 3.057986,2.659029 C 3.049868,2.686336 3.045808,2.714011 3.045808,2.742055 C 3.045808,2.755339 3.045439,2.762719 3.044701,2.764195 L 3.044701,2.766409 C 3.043963,2.767885 3.043410,2.769731 3.043041,2.771945 C 3.042672,2.774159 3.041934,2.776557 3.040827,2.779140 C 3.039720,2.781723 3.036952,2.783015 3.032524,2.783015 C 3.025144,2.782277 3.020716,2.777295 3.019240,2.768070 C 3.017764,2.758845 3.017026,2.745745 3.017026,2.728771 L 3.017026,2.717701 C 3.017026,2.697037 3.015550,2.672314 3.012598,2.643531 L 3.012598,2.631354 C 3.012598,2.615118 3.015919,2.599251 3.022561,2.583753 C 3.024775,2.579325 3.025882,2.576373 3.025882,2.574897 C 3.021454,2.561612 3.018871,2.541317 3.018133,2.514011 C 3.017395,2.486705 3.017026,2.457922 3.017026,2.427664 C 3.017026,2.349435 3.013705,2.307000 3.007063,2.300358 C 2.996731,2.315856 2.987321,2.332461 2.978834,2.350173 C 2.970347,2.367885 2.963152,2.381354 2.957248,2.390579 C 2.951344,2.399804 2.946915,2.410690 2.943963,2.423236 C 2.941749,2.429878 2.938059,2.433199 2.932893,2.433199 C 2.924775,2.433199 2.919240,2.425819 2.916288,2.411059 C 2.916288,2.401465 2.912229,2.387074 2.904111,2.367885 C 2.887875,2.329509 2.876805,2.309583 2.870901,2.308107 C 2.864997,2.325819 2.862045,2.339841 2.862045,2.350173 L 2.863152,2.362350 C 2.863152,2.384491 2.860938,2.408107 2.856510,2.433199 C 2.854296,2.446483 2.853004,2.459952 2.852635,2.473605 C 2.852266,2.487258 2.850606,2.501649 2.847653,2.516778 C 2.844701,2.531908 2.842118,2.547406 2.839904,2.563273 C 2.837690,2.579140 2.834738,2.594823 2.831048,2.610321 C 2.826620,2.633937 2.823853,2.652572 2.822746,2.666225 C 2.821639,2.679878 2.819978,2.689841 2.817764,2.696114 C 2.815550,2.702387 2.811122,2.705893 2.804480,2.706631 C 2.800790,2.706631 2.798207,2.705708 2.796731,2.703863 C 2.795255,2.702018 2.794148,2.700173 2.793410,2.698328 C 2.792672,2.696483 2.791934,2.695192 2.791196,2.694454 C 2.788982,2.689288 2.787875,2.683015 2.787875,2.675635 L 2.787875,2.671207 C 2.787875,2.664564 2.786030,2.657922 2.782340,2.651280 C 2.778650,2.644638 2.764997,2.640210 2.741380,2.637996 C 2.712598,2.637996 2.696362,2.653494 2.692672,2.684491 C 2.690458,2.698513 2.689351,2.712904 2.689351,2.727664 C 2.689351,2.760874 2.686030,2.780432 2.679388,2.786336 C 2.676436,2.788550 2.673484,2.789657 2.670532,2.789657 M 3.662414,2.830616 C 3.655034,2.830616 3.650606,2.826557 3.649130,2.818439 L 3.646915,2.790764 L 3.648022,2.774159 C 3.648022,2.760136 3.639535,2.728402 3.622561,2.678956 C 3.620347,2.673790 3.619240,2.668254 3.619240,2.662350 C 3.617764,2.650542 3.612598,2.644638 3.603742,2.644638 L 3.576067,2.646852 C 3.555403,2.646852 3.533078,2.643900 3.509093,2.637996 C 3.485107,2.632092 3.469425,2.624712 3.462045,2.615856 C 3.436214,2.632830 3.418871,2.641317 3.410015,2.641317 C 3.405587,2.641317 3.401528,2.640210 3.397838,2.637996 C 3.394148,2.635782 3.386768,2.634675 3.375698,2.634675 C 3.365366,2.634675 3.357801,2.636151 3.353004,2.639103 C 3.348207,2.642055 3.345808,2.648328 3.345808,2.657922 L 3.346915,2.676742 C 3.346915,2.687074 3.345439,2.697406 3.342487,2.707738 C 3.341749,2.712166 3.341011,2.716409 3.340273,2.720469 C 3.339535,2.724528 3.337875,2.727480 3.335292,2.729325 C 3.332709,2.731170 3.329572,2.732092 3.325882,2.732092 C 3.320716,2.732092 3.316288,2.728402 3.312598,2.721022 C 3.308170,2.700358 3.305218,2.684491 3.303742,2.673421 C 3.302266,2.662350 3.300421,2.652941 3.298207,2.645192 C 3.295993,2.637443 3.291934,2.628587 3.286030,2.618623 C 3.280126,2.608660 3.277174,2.598144 3.277174,2.587074 C 3.277174,2.577480 3.278281,2.567885 3.280495,2.558291 C 3.284185,2.540579 3.286952,2.521760 3.288797,2.501834 C 3.290642,2.481908 3.291749,2.463457 3.292118,2.446483 C 3.292487,2.429509 3.293410,2.417701 3.294886,2.411059 L 3.295993,2.401096 C 3.295993,2.395192 3.295255,2.388919 3.293779,2.382277 C 3.292303,2.375635 3.291565,2.368254 3.291565,2.360136 C 3.291565,2.357922 3.290089,2.355708 3.287137,2.353494 C 3.275329,2.346114 3.269425,2.337996 3.269425,2.329140 C 3.269425,2.323236 3.270901,2.315671 3.273853,2.306446 C 3.276805,2.297221 3.279757,2.284491 3.282709,2.268254 C 3.285661,2.252018 3.287137,2.230616 3.287137,2.204048 C 3.287137,2.190026 3.286214,2.174528 3.284369,2.157553 C 3.282524,2.140579 3.281602,2.120653 3.281602,2.097775 L 3.282709,2.036889 C 3.282709,2.019915 3.281417,2.006077 3.278834,1.995376 C 3.276251,1.984675 3.274960,1.975266 3.274960,1.967147 L 3.273853,1.927295 C 3.273853,1.910321 3.275882,1.895930 3.279941,1.884122 C 3.284000,1.872314 3.293041,1.866409 3.307063,1.866409 L 3.319240,1.867516 C 3.327358,1.868992 3.344701,1.869731 3.371270,1.869731 L 3.433262,1.869731 C 3.448761,1.870469 3.458724,1.876373 3.463152,1.887443 C 3.465366,1.892609 3.467949,1.895192 3.470901,1.895192 C 3.475329,1.895192 3.481233,1.891871 3.488613,1.885229 C 3.510015,1.870469 3.541749,1.863088 3.583816,1.863088 C 3.602266,1.863088 3.620347,1.866409 3.638059,1.873052 C 3.655772,1.879694 3.677174,1.891133 3.702266,1.907369 C 3.715550,1.915487 3.731048,1.932461 3.748761,1.958291 C 3.775329,1.996668 3.788613,2.040579 3.788613,2.090026 C 3.788613,2.126188 3.782709,2.157922 3.770901,2.185229 C 3.759093,2.212535 3.746546,2.230616 3.733262,2.239472 L 3.755403,2.262719 C 3.771639,2.278218 3.786399,2.295561 3.799683,2.314749 C 3.815181,2.339841 3.822930,2.375635 3.822930,2.422129 C 3.822930,2.454601 3.815550,2.488919 3.800790,2.525081 C 3.795624,2.539841 3.788797,2.552018 3.780310,2.561612 C 3.771823,2.571207 3.760200,2.582646 3.745439,2.595930 L 3.704480,2.634675 C 3.697838,2.642055 3.693041,2.654786 3.690089,2.672867 C 3.687137,2.690948 3.685661,2.708107 3.685661,2.724343 C 3.685661,2.732461 3.685845,2.738181 3.686214,2.741502 C 3.686583,2.744823 3.686952,2.747959 3.687321,2.750911 C 3.687690,2.753863 3.687875,2.758291 3.687875,2.764195 C 3.687875,2.772314 3.685845,2.780432 3.681786,2.788550 C 3.677727,2.796668 3.675329,2.806262 3.674591,2.817332 C 3.673115,2.826188 3.669056,2.830616 3.662414,2.830616 M 3.524037,2.489657 C 3.574960,2.489657 3.601159,2.466040 3.602635,2.418808 C 3.602635,2.403310 3.598207,2.391133 3.589351,2.382277 C 3.580495,2.373421 3.567580,2.366040 3.550606,2.360136 C 3.546177,2.358660 3.542118,2.357922 3.538428,2.357922 C 3.528096,2.357922 3.521639,2.363088 3.519056,2.373421 C 3.516473,2.383753 3.514997,2.395007 3.514628,2.407184 C 3.514259,2.419362 3.512967,2.430063 3.510753,2.439288 C 3.508539,2.448513 3.503004,2.453125 3.494148,2.453125 C 3.487506,2.453125 3.483078,2.451649 3.480864,2.448697 C 3.478650,2.445745 3.477543,2.441317 3.477543,2.435413 C 3.477543,2.431723 3.477912,2.426742 3.478650,2.420469 C 3.479388,2.414195 3.479757,2.407369 3.479757,2.399989 C 3.479757,2.390395 3.477543,2.380432 3.473115,2.370100 L 3.473115,2.373421 C 3.473115,2.382277 3.472561,2.389841 3.471454,2.396114 C 3.470347,2.402387 3.469794,2.410321 3.469794,2.419915 C 3.469794,2.428771 3.470532,2.437996 3.472008,2.447590 L 3.474222,2.461981 C 3.474222,2.464933 3.473668,2.467885 3.472561,2.470838 C 3.471454,2.473790 3.470901,2.476742 3.470901,2.479694 C 3.472377,2.485598 3.476805,2.488550 3.484185,2.488550 L 3.524037,2.489657 M 3.497469,2.169731 C 3.518133,2.168992 3.535476,2.160136 3.549499,2.143162 C 3.555403,2.135044 3.563152,2.128402 3.572746,2.123236 C 3.575698,2.121022 3.577174,2.117701 3.577174,2.113273 C 3.577174,2.105155 3.575144,2.096114 3.571085,2.086151 C 3.567026,2.076188 3.563521,2.068992 3.560569,2.064564 C 3.560569,2.080801 3.559277,2.092793 3.556694,2.100542 C 3.554111,2.108291 3.549130,2.112166 3.541749,2.112166 C 3.532155,2.112166 3.527358,2.104786 3.527358,2.090026 L 3.527358,2.082277 C 3.527358,2.061612 3.523853,2.047221 3.516842,2.039103 C 3.509831,2.030985 3.502266,2.026926 3.494148,2.026926 C 3.481602,2.026926 3.475329,2.034675 3.475329,2.050173 L 3.476436,2.067885 L 3.475329,2.094454 C 3.475329,2.102572 3.475882,2.110690 3.476989,2.118808 C 3.478096,2.126926 3.478650,2.136520 3.478650,2.147590 L 3.478650,2.160874 C 3.478650,2.168254 3.480864,2.171945 3.485292,2.171945 L 3.497469,2.169731 M 3.910384,2.816225 C 3.905956,2.816225 3.901713,2.812719 3.897653,2.805708 C 3.893594,2.798697 3.891565,2.790764 3.891565,2.781908 L 3.891565,2.767516 C 3.890827,2.760874 3.889351,2.747221 3.887137,2.726557 C 3.884923,2.705893 3.882524,2.684122 3.879941,2.661243 C 3.877358,2.638365 3.876067,2.622498 3.876067,2.613642 L 3.878281,2.569362 C 3.880495,2.531723 3.881602,2.493347 3.881602,2.454232 C 3.881602,2.435044 3.881233,2.421022 3.880495,2.412166 L 3.880495,2.405524 C 3.880495,2.400358 3.880864,2.395561 3.881602,2.391133 C 3.882340,2.386705 3.882709,2.381908 3.882709,2.376742 L 3.882709,2.352387 C 3.881233,2.325081 3.880495,2.290764 3.880495,2.249435 L 3.880495,2.144269 C 3.880495,2.136889 3.878281,2.131170 3.873853,2.127111 C 3.869425,2.123052 3.867211,2.116225 3.867211,2.106631 L 3.868318,2.088919 C 3.872746,2.055708 3.874960,2.029509 3.874960,2.010321 C 3.874960,1.988919 3.873853,1.973421 3.871639,1.963826 L 3.870532,1.945007 C 3.870532,1.938365 3.872746,1.929325 3.877174,1.917885 C 3.881602,1.906446 3.888059,1.896299 3.896546,1.887443 C 3.905034,1.878587 3.915550,1.874159 3.928096,1.874159 C 3.935476,1.874159 3.944517,1.875450 3.955218,1.878033 C 3.965919,1.880616 3.978281,1.881908 3.992303,1.881908 C 4.001897,1.881908 4.009093,1.881354 4.013890,1.880247 C 4.018687,1.879140 4.024406,1.878218 4.031048,1.877480 C 4.044332,1.877480 4.053927,1.883937 4.059831,1.896852 C 4.065735,1.909767 4.068687,1.923236 4.068687,1.937258 C 4.068687,1.944638 4.067764,1.951280 4.065919,1.957184 C 4.064074,1.963088 4.063152,1.976742 4.063152,1.998144 C 4.063152,2.023236 4.064074,2.053863 4.065919,2.090026 C 4.067764,2.126188 4.068687,2.157184 4.068687,2.183015 C 4.068687,2.202203 4.068133,2.215118 4.067026,2.221760 C 4.065919,2.228402 4.065366,2.234306 4.065366,2.239472 C 4.065366,2.257922 4.069056,2.276373 4.076436,2.294823 C 4.080864,2.311059 4.083447,2.327664 4.084185,2.344638 L 4.089720,2.388919 C 4.089720,2.399251 4.084554,2.405893 4.074222,2.408845 C 4.067580,2.411059 4.064259,2.414749 4.064259,2.419915 L 4.065366,2.437627 C 4.065366,2.449435 4.064628,2.460874 4.063152,2.471945 C 4.061676,2.483015 4.060938,2.494085 4.060938,2.505155 C 4.062414,2.530247 4.065735,2.550173 4.070901,2.564933 C 4.074591,2.576742 4.076436,2.587443 4.076436,2.597037 C 4.076436,2.606631 4.073115,2.615118 4.066473,2.622498 C 4.064997,2.624712 4.064259,2.627295 4.064259,2.630247 L 4.064259,2.647959 C 4.064259,2.678956 4.058355,2.716963 4.046546,2.761981 C 4.044332,2.768623 4.041011,2.771945 4.036583,2.771945 C 4.033631,2.771945 4.030126,2.769915 4.026067,2.765856 C 4.022008,2.761797 4.019240,2.753863 4.017764,2.742055 L 4.014443,2.709952 C 4.012229,2.682646 4.010200,2.668254 4.008355,2.666778 C 4.006510,2.665302 4.001897,2.664564 3.994517,2.664564 L 3.949130,2.666778 C 3.944701,2.666778 3.941749,2.668992 3.940273,2.673421 L 3.933631,2.696668 C 3.926251,2.713642 3.922561,2.730616 3.922561,2.747590 L 3.923668,2.759767 C 3.923668,2.780432 3.922746,2.795007 3.920901,2.803494 C 3.919056,2.811981 3.915550,2.816225 3.910384,2.816225 M 4.223668,2.923605 C 4.209646,2.923605 4.202635,2.909214 4.202635,2.880432 L 4.203742,2.862719 C 4.195624,2.822867 4.191565,2.790026 4.191565,2.764195 L 4.191565,2.757553 C 4.191565,2.739841 4.190273,2.724159 4.187690,2.710505 C 4.185107,2.696852 4.179019,2.684491 4.169425,2.673421 C 4.165735,2.670469 4.163336,2.667516 4.162229,2.664564 C 4.161122,2.661612 4.159646,2.657000 4.157801,2.650727 C 4.155956,2.644454 4.149499,2.626188 4.138428,2.595930 C 4.135476,2.590026 4.134000,2.583753 4.134000,2.577111 C 4.134000,2.573421 4.135107,2.569731 4.137321,2.566040 C 4.142487,2.557184 4.145993,2.547590 4.147838,2.537258 C 4.149683,2.526926 4.150975,2.513642 4.151713,2.497406 C 4.152451,2.475266 4.155403,2.444269 4.160569,2.404417 C 4.160569,2.391871 4.159831,2.382092 4.158355,2.375081 C 4.156879,2.368070 4.156141,2.361243 4.156141,2.354601 L 4.157248,2.300358 C 4.158724,2.269362 4.159831,2.237443 4.160569,2.204601 C 4.161307,2.171760 4.162045,2.149435 4.162783,2.137627 C 4.162783,2.128771 4.161860,2.120100 4.160015,2.111612 C 4.158170,2.103125 4.157248,2.094823 4.157248,2.086705 L 4.158355,2.080063 C 4.158355,2.075635 4.158724,2.072683 4.159462,2.071207 C 4.158724,2.067516 4.156141,2.065671 4.151713,2.065671 L 4.147284,2.065671 C 4.139904,2.065671 4.136214,2.059767 4.136214,2.047959 C 4.136214,2.035413 4.138797,2.014749 4.143963,1.985967 C 4.146915,1.971207 4.148391,1.960136 4.148391,1.952756 L 4.148391,1.947221 C 4.148391,1.937627 4.150052,1.928033 4.153373,1.918439 C 4.156694,1.908845 4.165366,1.900358 4.179388,1.892978 C 4.199314,1.884122 4.218871,1.879694 4.238059,1.879694 C 4.249868,1.879694 4.262783,1.880432 4.276805,1.881908 C 4.296731,1.884860 4.325144,1.886336 4.362045,1.886336 C 4.379757,1.886336 4.396546,1.885782 4.412414,1.884675 C 4.428281,1.883568 4.455034,1.883015 4.492672,1.883015 C 4.502266,1.883015 4.511307,1.881723 4.519794,1.879140 C 4.528281,1.876557 4.544332,1.875266 4.567949,1.875266 C 4.582709,1.875266 4.601528,1.876373 4.624406,1.878587 C 4.641380,1.881539 4.651528,1.890948 4.654849,1.906815 C 4.658170,1.922683 4.659831,1.939103 4.659831,1.956077 L 4.659831,1.970469 C 4.659831,1.984491 4.658355,1.997221 4.655403,2.008660 C 4.652451,2.020100 4.649130,2.032092 4.645439,2.044638 C 4.634369,2.071945 4.624775,2.115487 4.616657,2.175266 C 4.615919,2.183384 4.614074,2.191133 4.611122,2.198513 C 4.608170,2.205893 4.602266,2.209583 4.593410,2.209583 C 4.580864,2.208845 4.574591,2.195561 4.574591,2.169731 C 4.574591,2.157184 4.575329,2.144085 4.576805,2.130432 C 4.578281,2.116778 4.579019,2.105155 4.579019,2.095561 C 4.579019,2.077111 4.575698,2.067885 4.569056,2.067885 C 4.566104,2.068623 4.563336,2.069362 4.560753,2.070100 C 4.558170,2.070838 4.554296,2.071207 4.549130,2.071207 C 4.542487,2.071207 4.536030,2.070469 4.529757,2.068992 C 4.523484,2.067516 4.517395,2.066778 4.511491,2.066778 L 4.474960,2.066778 C 4.461676,2.066778 4.448761,2.068254 4.436214,2.071207 C 4.433262,2.071945 4.429941,2.072314 4.426251,2.072314 C 4.418871,2.072314 4.411122,2.071207 4.403004,2.068992 C 4.394886,2.066778 4.386768,2.065302 4.378650,2.064564 C 4.365366,2.064564 4.358724,2.070100 4.358724,2.081170 L 4.358724,2.094454 C 4.356510,2.101096 4.355403,2.108107 4.355403,2.115487 C 4.355403,2.125081 4.356325,2.134306 4.358170,2.143162 C 4.360015,2.152018 4.361307,2.160505 4.362045,2.168623 C 4.362783,2.173790 4.364259,2.176373 4.366473,2.176373 C 4.368687,2.176373 4.371270,2.175635 4.374222,2.174159 C 4.380126,2.171207 4.388613,2.169731 4.399683,2.169731 C 4.404111,2.169731 4.409093,2.170653 4.414628,2.172498 C 4.420163,2.174343 4.428465,2.175266 4.439535,2.175266 L 4.468318,2.174159 C 4.480864,2.174159 4.491934,2.176742 4.501528,2.181908 C 4.511122,2.187074 4.515919,2.198882 4.515919,2.217332 L 4.515919,2.260505 C 4.515919,2.283384 4.511491,2.304786 4.502635,2.324712 C 4.496731,2.342424 4.493779,2.361612 4.493779,2.382277 L 4.493779,2.391133 C 4.493779,2.397037 4.493225,2.402203 4.492118,2.406631 C 4.491011,2.411059 4.486768,2.413273 4.479388,2.413273 C 4.467580,2.413273 4.461676,2.405524 4.461676,2.390026 C 4.461676,2.383384 4.462229,2.377480 4.463336,2.372314 C 4.464443,2.367147 4.464997,2.361981 4.464997,2.356815 C 4.464997,2.352387 4.461676,2.350173 4.455034,2.350173 C 4.435845,2.350173 4.422377,2.351096 4.414628,2.352941 C 4.406879,2.354786 4.400790,2.356631 4.396362,2.358476 C 4.391934,2.360321 4.387506,2.361243 4.383078,2.361243 C 4.379388,2.361243 4.376067,2.360690 4.373115,2.359583 C 4.370163,2.358476 4.366842,2.357553 4.363152,2.356815 C 4.359462,2.356815 4.357617,2.358660 4.357617,2.362350 L 4.358724,2.371207 C 4.360938,2.375635 4.362045,2.381539 4.362045,2.388919 C 4.362045,2.397037 4.361491,2.404601 4.360384,2.411612 C 4.359277,2.418623 4.358724,2.425081 4.358724,2.430985 C 4.358724,2.442055 4.362783,2.451096 4.370901,2.458107 C 4.379019,2.465118 4.397838,2.468623 4.427358,2.468623 C 4.437690,2.468623 4.447284,2.468254 4.456141,2.467516 C 4.464997,2.466778 4.476067,2.466040 4.489351,2.465302 C 4.507063,2.465302 4.529572,2.466963 4.556879,2.470284 C 4.584185,2.473605 4.603742,2.478587 4.615550,2.485229 C 4.631048,2.494085 4.642118,2.506446 4.648761,2.522314 C 4.655403,2.538181 4.658724,2.562719 4.658724,2.595930 C 4.658724,2.632830 4.655403,2.684860 4.648761,2.752018 C 4.646546,2.768992 4.642118,2.781354 4.635476,2.789103 C 4.628834,2.796852 4.621823,2.800727 4.614443,2.800727 C 4.607801,2.800727 4.602082,2.798144 4.597284,2.792978 C 4.592487,2.787812 4.590089,2.780801 4.590089,2.771945 C 4.590089,2.766778 4.591011,2.760874 4.592856,2.754232 C 4.594701,2.747590 4.595624,2.740948 4.595624,2.734306 C 4.595624,2.720284 4.593041,2.706631 4.587875,2.693347 C 4.586399,2.687443 4.585107,2.682092 4.584000,2.677295 C 4.582893,2.672498 4.580864,2.669546 4.577912,2.668439 C 4.574960,2.667332 4.570716,2.666778 4.565181,2.666778 C 4.559646,2.666778 4.554665,2.666409 4.550237,2.665671 C 4.535476,2.664195 4.520716,2.663457 4.505956,2.663457 C 4.497100,2.663457 4.490273,2.663826 4.485476,2.664564 C 4.480679,2.665302 4.475329,2.665671 4.469425,2.665671 C 4.463521,2.665671 4.457432,2.665118 4.451159,2.664011 C 4.444886,2.662904 4.438059,2.662350 4.430679,2.662350 C 4.409277,2.662350 4.390089,2.660505 4.373115,2.656815 C 4.359093,2.653863 4.346177,2.652387 4.334369,2.652387 C 4.320347,2.652387 4.307986,2.656631 4.297284,2.665118 C 4.286583,2.673605 4.277358,2.689657 4.269609,2.713273 C 4.261860,2.736889 4.255403,2.771207 4.250237,2.816225 L 4.249130,2.846114 L 4.249130,2.853863 C 4.249130,2.868623 4.247284,2.883384 4.243594,2.898144 C 4.236952,2.915118 4.230310,2.923605 4.223668,2.923605"/><path fill="currentColor" fill-rule="evenodd" d="M 4.723717,1.875000 L 5.051080,1.875000 C 5.139612,1.875000 5.207684,1.881949 5.255295,1.895846 C 5.302907,1.909744 5.338680,1.929818 5.362615,1.956069 C 5.386549,1.982319 5.402763,2.014103 5.411256,2.051421 C 5.419749,2.088738 5.423995,2.146515 5.423995,2.224753 L 5.423995,2.333616 C 5.423995,2.413398 5.415760,2.471562 5.399289,2.508107 C 5.382818,2.544652 5.352578,2.572704 5.308569,2.592264 C 5.264560,2.611823 5.207040,2.621603 5.136009,2.621603 L 5.048764,2.621603 L 5.048764,3.125000 L 4.723717,3.125000 L 4.723717,1.875000 M 5.048764,2.088867 L 5.048764,2.406964 C 5.058029,2.407479 5.066007,2.407736 5.072698,2.407736 C 5.102552,2.407736 5.123269,2.400401 5.134851,2.385732 C 5.146432,2.371062 5.152223,2.340565 5.152223,2.294240 L 5.152223,2.191553 C 5.152223,2.148832 5.145531,2.121037 5.132148,2.108169 C 5.118766,2.095301 5.090971,2.088867 5.048764,2.088867 M 5.805436,1.875000 L 5.805436,2.874846 L 6.003089,2.874846 L 6.003089,3.125000 L 5.480390,3.125000 L 5.480390,1.875000 L 5.805436,1.875000 M 6.782136,2.606933 C 6.782136,2.732525 6.779176,2.821443 6.773257,2.873687 C 6.767338,2.925932 6.748808,2.973672 6.717667,3.016909 C 6.686526,3.060145 6.644448,3.093345 6.591432,3.116507 C 6.538415,3.139670 6.476649,3.151251 6.406132,3.151251 C 6.339218,3.151251 6.279125,3.140313 6.225851,3.118437 C 6.172577,3.096562 6.129727,3.063748 6.097300,3.019997 C 6.064872,2.976246 6.045570,2.928634 6.039393,2.877162 C 6.033217,2.825690 6.030128,2.735614 6.030128,2.606933 L 6.030128,2.393067 C 6.030128,2.267475 6.033088,2.178557 6.039007,2.126313 C 6.044927,2.074068 6.063457,2.026328 6.094597,1.983091 C 6.125738,1.939855 6.167816,1.906655 6.220833,1.883493 C 6.273849,1.860330 6.335615,1.848749 6.406132,1.848749 C 6.473046,1.848749 6.533140,1.859687 6.586413,1.881563 C 6.639687,1.903438 6.682537,1.936252 6.714965,1.980003 C 6.747392,2.023754 6.766694,2.071366 6.772871,2.122838 C 6.779048,2.174310 6.782136,2.264386 6.782136,2.393067 L 6.782136,2.606933 M 6.457090,2.196186 C 6.457090,2.138022 6.453873,2.100834 6.447439,2.084620 C 6.441005,2.068406 6.427750,2.060300 6.407676,2.060300 C 6.390691,2.060300 6.377694,2.066862 6.368686,2.079988 C 6.359679,2.093113 6.355175,2.131846 6.355175,2.196186 L 6.355175,2.779880 C 6.355175,2.852455 6.358134,2.897236 6.364054,2.914222 C 6.369973,2.931208 6.383742,2.939700 6.405360,2.939700 C 6.427493,2.939700 6.441648,2.929921 6.447825,2.910361 C 6.454001,2.890802 6.457090,2.844220 6.457090,2.770615 L 6.457090,2.196186 M 7.521051,1.875000 L 7.521051,2.125154 L 7.328030,2.125154 L 7.328030,3.125000 L 7.002984,3.125000 L 7.002984,2.125154 L 6.810736,2.125154 L 6.810736,1.875000 L 7.521051,1.875000"/></svg>'
 ZOMBIE_SVG = '<svg class="zombie" viewBox="0 0 16 18" shape-rendering="crispEdges" aria-hidden="true"><g class="fa"><rect x="4" y="0" width="5" height="1" fill="#3b2f27"/><rect x="3" y="1" width="8" height="1" fill="#3b2f27"/><rect x="3" y="2" width="2" height="1" fill="#3b2f27"/><rect x="5" y="2" width="6" height="1" fill="#86c35f"/><rect x="11" y="2" width="1" height="1" fill="#5c9440"/><rect x="3" y="3" width="1" height="1" fill="#3b2f27"/><rect x="4" y="3" width="3" height="1" fill="#86c35f"/><rect x="7" y="3" width="1" height="1" fill="#f2f2e8"/><rect x="8" y="3" width="1" height="1" fill="#141816"/><rect x="9" y="3" width="2" height="1" fill="#86c35f"/><rect x="11" y="3" width="1" height="1" fill="#5c9440"/><rect x="3" y="4" width="1" height="1" fill="#5c9440"/><rect x="4" y="4" width="7" height="1" fill="#86c35f"/><rect x="11" y="4" width="1" height="1" fill="#5c9440"/><rect x="3" y="5" width="1" height="1" fill="#5c9440"/><rect x="4" y="5" width="4" height="1" fill="#86c35f"/><rect x="8" y="5" width="2" height="1" fill="#a8352c"/><rect x="10" y="5" width="2" height="1" fill="#86c35f"/><rect x="4" y="6" width="1" height="1" fill="#5c9440"/><rect x="5" y="6" width="2" height="1" fill="#86c35f"/><rect x="7" y="6" width="2" height="1" fill="#a8352c"/><rect x="9" y="6" width="2" height="1" fill="#86c35f"/><rect x="5" y="7" width="1" height="1" fill="#5c9440"/><rect x="6" y="7" width="3" height="1" fill="#86c35f"/><rect x="4" y="8" width="4" height="1" fill="#6f86a6"/><rect x="8" y="8" width="7" height="1" fill="#86c35f"/><rect x="3" y="9" width="1" height="1" fill="#6f86a6"/><rect x="4" y="9" width="1" height="1" fill="#4f6380"/><rect x="5" y="9" width="3" height="1" fill="#6f86a6"/><rect x="8" y="9" width="1" height="1" fill="#5c9440"/><rect x="9" y="9" width="5" height="1" fill="#86c35f"/><rect x="14" y="9" width="1" height="1" fill="#5c9440"/><rect x="3" y="10" width="1" height="1" fill="#6f86a6"/><rect x="4" y="10" width="1" height="1" fill="#4f6380"/><rect x="5" y="10" width="4" height="1" fill="#6f86a6"/><rect x="3" y="11" width="3" height="1" fill="#6f86a6"/><rect x="6" y="11" width="1" height="1" fill="#4f6380"/><rect x="7" y="11" width="2" height="1" fill="#6f86a6"/><rect x="3" y="12" width="1" height="1" fill="#6f86a6"/><rect x="4" y="12" width="1" height="1" fill="#4f6380"/><rect x="5" y="12" width="2" height="1" fill="#6f86a6"/><rect x="7" y="12" width="1" height="1" fill="#4f6380"/><rect x="8" y="12" width="1" height="1" fill="#6f86a6"/><rect x="3" y="13" width="6" height="1" fill="#5a4636"/><rect x="3" y="14" width="2" height="1" fill="#5a4636"/><rect x="7" y="14" width="3" height="1" fill="#5a4636"/><rect x="2" y="15" width="2" height="1" fill="#5a4636"/><rect x="4" y="15" width="1" height="1" fill="#3d2f24"/><rect x="8" y="15" width="2" height="1" fill="#5a4636"/><rect x="2" y="16" width="1" height="1" fill="#5a4636"/><rect x="3" y="16" width="1" height="1" fill="#3d2f24"/><rect x="9" y="16" width="2" height="1" fill="#5a4636"/><rect x="1" y="17" width="3" height="1" fill="#22262a"/><rect x="9" y="17" width="4" height="1" fill="#22262a"/></g><g class="fb"><rect x="4" y="0" width="5" height="1" fill="#3b2f27"/><rect x="3" y="1" width="8" height="1" fill="#3b2f27"/><rect x="3" y="2" width="2" height="1" fill="#3b2f27"/><rect x="5" y="2" width="6" height="1" fill="#86c35f"/><rect x="11" y="2" width="1" height="1" fill="#5c9440"/><rect x="3" y="3" width="1" height="1" fill="#3b2f27"/><rect x="4" y="3" width="3" height="1" fill="#86c35f"/><rect x="7" y="3" width="1" height="1" fill="#f2f2e8"/><rect x="8" y="3" width="1" height="1" fill="#141816"/><rect x="9" y="3" width="2" height="1" fill="#86c35f"/><rect x="11" y="3" width="1" height="1" fill="#5c9440"/><rect x="3" y="4" width="1" height="1" fill="#5c9440"/><rect x="4" y="4" width="7" height="1" fill="#86c35f"/><rect x="11" y="4" width="1" height="1" fill="#5c9440"/><rect x="3" y="5" width="1" height="1" fill="#5c9440"/><rect x="4" y="5" width="4" height="1" fill="#86c35f"/><rect x="8" y="5" width="2" height="1" fill="#a8352c"/><rect x="10" y="5" width="2" height="1" fill="#86c35f"/><rect x="4" y="6" width="1" height="1" fill="#5c9440"/><rect x="5" y="6" width="2" height="1" fill="#86c35f"/><rect x="7" y="6" width="2" height="1" fill="#a8352c"/><rect x="9" y="6" width="2" height="1" fill="#86c35f"/><rect x="5" y="7" width="1" height="1" fill="#5c9440"/><rect x="6" y="7" width="3" height="1" fill="#86c35f"/><rect x="4" y="8" width="4" height="1" fill="#6f86a6"/><rect x="3" y="9" width="1" height="1" fill="#6f86a6"/><rect x="4" y="9" width="1" height="1" fill="#4f6380"/><rect x="5" y="9" width="4" height="1" fill="#6f86a6"/><rect x="9" y="9" width="7" height="1" fill="#86c35f"/><rect x="3" y="10" width="1" height="1" fill="#6f86a6"/><rect x="4" y="10" width="1" height="1" fill="#4f6380"/><rect x="5" y="10" width="3" height="1" fill="#6f86a6"/><rect x="8" y="10" width="1" height="1" fill="#5c9440"/><rect x="9" y="10" width="5" height="1" fill="#86c35f"/><rect x="14" y="10" width="1" height="1" fill="#5c9440"/><rect x="3" y="11" width="3" height="1" fill="#6f86a6"/><rect x="6" y="11" width="1" height="1" fill="#4f6380"/><rect x="7" y="11" width="2" height="1" fill="#6f86a6"/><rect x="3" y="12" width="1" height="1" fill="#6f86a6"/><rect x="4" y="12" width="1" height="1" fill="#4f6380"/><rect x="5" y="12" width="2" height="1" fill="#6f86a6"/><rect x="7" y="12" width="1" height="1" fill="#4f6380"/><rect x="8" y="12" width="1" height="1" fill="#6f86a6"/><rect x="3" y="13" width="6" height="1" fill="#5a4636"/><rect x="4" y="14" width="2" height="1" fill="#5a4636"/><rect x="7" y="14" width="2" height="1" fill="#5a4636"/><rect x="4" y="15" width="2" height="1" fill="#5a4636"/><rect x="8" y="15" width="2" height="1" fill="#5a4636"/><rect x="4" y="16" width="1" height="1" fill="#3d2f24"/><rect x="5" y="16" width="1" height="1" fill="#5a4636"/><rect x="8" y="16" width="1" height="1" fill="#5a4636"/><rect x="9" y="16" width="1" height="1" fill="#3d2f24"/><rect x="3" y="17" width="3" height="1" fill="#22262a"/><rect x="9" y="17" width="4" height="1" fill="#22262a"/></g></svg>'
+# The zombie arm progress bar, shared by the phone/desktop page and the Car Thing page.
+# Old-style JavaScript on purpose: the Car Thing's browser is old.
+ARM_CSS = """
+.arm svg{display:block;width:100%;height:auto;image-rendering:pixelated}
+.zfa{animation:zgrab .7s steps(1) infinite}
+.zfb{animation:zgrab .7s steps(1) infinite;animation-delay:-.35s}
+@keyframes zgrab{0%{visibility:visible}50%{visibility:hidden}}
+@media (prefers-reduced-motion: reduce){.zfa,.zfb{animation:none}.zfb{visibility:hidden}}
+"""
+ARM_JS = r"""
+function zpArm(W, p){
+  var base = [], A = [], B = [], done = p >= 100;
+  function add(L, x, y, w, h, f){ if(w > 0 && h > 0) L.push('<rect x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" fill="' + f + '"/>'); }
+  var bx = W - 16;
+  function put(L, rows, top, colors){
+    for(var j = 0; j < rows.length; j++) for(var i = 0; i < rows[j].length; i++){
+      var c = rows[j].charAt(i); if(c !== '.') add(L, bx - 5 + i, top + j, 1, 1, colors[c]);
+    }
+  }
+  var SKIN = '#86c35f', SHADE = '#5c9440', DARK = '#3b2f27', BLOOD = '#a8352c', SHIRT = '#6f86a6', SHIRT2 = '#4f6380';
+  add(base, 0, 1, W, 12, '#1b1f22'); add(base, 0, 12, W, 1, '#30373d');
+  put(base, ['...ss.............ss', 's..sslsssssssslssss.'], 10, {s:'#9fc94d', l:'#cfe88a'});
+  put(base, ['.......ppp.ppp.p..', '......phhpppspppp.', '.....pppsspppsspp.', '.....pspppssppppsp',
+             '.....pppsppppsppp.', '......ppppppppccc.', '........pppp..ct..'], 4,
+      {p:'#f09ab0', h:'#ffd3de', s:'#a8455f', c:'#d4768f', t:'#c27088'});
+  put(base, ['...............tt'], 11, {t:'#c27088'});
+  add(base, 0, 3, 5, 8, SHIRT); add(base, 0, 9, 5, 2, SHIRT2); add(base, 1, 5, 1, 1, SHIRT2);
+  add(base, 5, 3, 1, 1, SHIRT); add(base, 5, 5, 1, 1, SHIRT); add(base, 5, 7, 1, 1, SHIRT2); add(base, 5, 9, 1, 1, SHIRT2);
+  var tip = done ? bx - 4 : Math.round(6 + (bx - 19) * Math.max(0, p) / 100), x;
+  add(base, 6, 5, tip - 6, 2, SKIN); add(base, 6, 7, tip - 6, 2, SHADE);
+  for(x = 11; x < tip - 2; x += 13) add(base, x, 6, 1, 1, BLOOD);
+  for(x = 17; x < tip - 3; x += 17) add(base, x, 7, 2, 1, DARK);
+  function closed(L){ add(L, tip, 4, 4, 6, SKIN); add(L, tip, 8, 4, 2, SHADE); add(L, tip + 4, 4, 1, 6, SHADE); add(L, tip + 3, 5, 1, 1, DARK); add(L, tip + 3, 7, 1, 1, DARK); }
+  if(done){ closed(A); }
+  else {
+    add(A, tip, 4, 3, 6, SKIN); add(A, tip, 8, 3, 2, SHADE); add(A, tip + 1, 3, 2, 1, SKIN);
+    add(A, tip + 3, 4, 3, 1, SKIN); add(A, tip + 3, 6, 4, 1, SKIN); add(A, tip + 3, 8, 3, 1, SHADE);
+    add(A, tip + 6, 4, 1, 1, DARK); add(A, tip + 7, 6, 1, 1, DARK); add(A, tip + 6, 8, 1, 1, DARK);
+    closed(B);
+  }
+  return '<svg viewBox="0 0 ' + W + ' 14" shape-rendering="crispEdges" role="img" aria-label="' + (done ? 'Done' : Math.round(p) + ' percent') + '">' +
+    base.join('') + '<g class="' + (done ? '' : 'zfa') + '">' + A.join('') + '</g><g class="zfb">' + B.join('') + '</g></svg>';
+}
+"""
+
 MASCOT_CSS = """
 .logo{height:24px;width:auto;display:block}
 .zombie{height:30px;width:auto;display:block}
@@ -2860,6 +3173,75 @@ h2{font-size:15px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)
 .setupsum .mini{width:96px;flex:0 0 96px}
 details{margin:14px 2px}summary{cursor:pointer;color:var(--dim);font-size:14px}
 #dg-log{font:12px/1.45 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-all;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px;margin:10px 0;user-select:text;-webkit-user-select:text}
+/* ---- 3.0 ---- */
+body{font-variant-numeric:tabular-nums}
+.lbl2{font-size:12px;font-weight:650;letter-spacing:.07em;text-transform:uppercase;color:var(--dim);margin:16px 2px 6px}
+#search{display:block;width:100%;min-height:44px;font:inherit;color:var(--text);background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:0 12px;margin:10px 0 0}
+li button.file{justify-content:flex-start;gap:12px;padding:8px 10px;min-height:56px}
+li button.file .n{flex:1;min-width:0}
+li button.file.cur{border-color:var(--go)}
+.th{width:52px;height:40px;flex:0 0 52px;border-radius:6px;background:var(--vinyl);display:flex;align-items:center;justify-content:center;overflow:hidden;color:var(--dim)}
+.th svg{width:44px;height:32px}
+li.fh button{min-height:38px;margin:4px 0 2px;background:none;border:0;justify-content:flex-start;gap:8px;font-weight:650;padding:0 4px;width:100%}
+li.fh button .c{color:var(--dim);font-weight:400;margin-left:auto}
+li.fh button svg{width:14px;height:14px;transition:transform .15s}
+li.fh button[aria-expanded=false] svg{transform:rotate(-90deg)}
+li.infold button.file{margin-left:14px;width:calc(100% - 14px)}
+#hist li{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:8px;background:var(--panel)}
+#hist .ht{display:flex;justify-content:space-between;gap:8px}#hist .ht b{font-weight:650;overflow-wrap:anywhere}
+#hist .hs{font-size:13px;color:var(--dim);margin-top:2px}
+#hist .hs .bad{color:var(--warn)}#hist .hs .now{color:var(--go)}
+#hist button{min-height:34px;font-size:14px;margin-top:8px}
+#progcard .pc-top{display:flex;align-items:baseline;justify-content:space-between;gap:10px}
+#pc-pct{font-size:34px;font-weight:750;line-height:1.1}
+#pc-eta{color:var(--dim);font-size:14px}
+#progcard .pc-foot{display:flex;justify-content:space-between;gap:10px;color:var(--dim);font-size:13px;margin-top:8px}
+#progcard .arm{margin-top:10px}
+#progcard #prog{margin:12px 0 4px}
+.stat{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:14px}
+.stat span:nth-child(odd){color:var(--dim)}.stat span:nth-child(even){text-align:right;overflow-wrap:anywhere}
+.stat .yes{color:var(--go)}
+#knifecard summary{list-style:none;cursor:pointer;font-weight:650;color:var(--text);font-size:16px;display:flex;justify-content:space-between}
+#knifecard summary::-webkit-details-marker{display:none}
+#knifecard summary::after{content:"Open";color:var(--dim);font-weight:400;font-size:14px}
+#knifecard[open] summary::after{content:"Close"}
+.kgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:10px 0}
+.kgrid button{min-height:52px;font-size:20px}
+#kpos{font-size:14px;color:var(--dim);margin:6px 2px}
+#legend{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:13px;color:var(--dim);margin:-2px 2px 10px}
+#legend i{display:inline-block;width:14px;height:10px;margin-right:6px;vertical-align:-1px;border-radius:2px}
+#stage .cut-done{stroke:var(--go);stroke-width:2.6}#stage use.cut-done{color:var(--go)}
+#stage.cutting .base use{opacity:.4}
+#stage .knife{fill:none;stroke:var(--warn);stroke-width:2;vector-effect:non-scaling-stroke}
+#setnav{display:flex;gap:6px;overflow-x:auto;margin:6px 0 4px;padding-bottom:4px}
+#setnav button{min-height:38px;font-size:14px;white-space:nowrap;border-radius:19px}
+#setnav button[aria-current=true]{background:var(--go);color:var(--go-text);border-color:var(--go)}
+.sec > h2:first-child{margin-top:10px}
+#drop{position:fixed;inset:12px;border:3px dashed var(--go);border-radius:18px;background:rgba(21,24,27,.82);z-index:50;display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:650;color:var(--go);pointer-events:none}
+.kbd{font:12px ui-monospace,Menlo,Consolas,monospace;border:1px solid var(--line);border-bottom-width:2px;border-radius:5px;padding:0 5px;color:var(--text)}
+#keys{display:none}
+#v-none{padding:60px 20px;text-align:center}
+/* tablet and desktop: files stay on the left */
+@media (min-width:760px){
+  body{max-width:none;padding:0 20px 20px}
+  #app{display:grid;grid-template-columns:300px minmax(0,1fr);gap:22px;align-items:start}
+  #side{position:sticky;top:68px;max-height:calc(100vh - 80px);overflow:auto;padding:0 4px 20px 0}
+  #side ul{margin-top:8px}
+  #vbar{flex-wrap:nowrap}#vbar .vtxt{flex:1 1 auto;flex-basis:auto}#vbar button{flex:0 0 auto;padding:0 14px}
+  #keys{display:block}
+}
+@media (min-width:1100px){
+  #app{grid-template-columns:320px minmax(0,1fr)}
+  #v-job:not([hidden]){display:grid;grid-template-columns:minmax(320px,370px) minmax(0,1fr);gap:22px;align-items:start}
+  #jobctl{grid-column:1;grid-row:1}
+  #jobview{grid-column:2;grid-row:1;position:sticky;top:68px}
+  #stage{height:calc(100vh - 250px);min-height:440px}
+  #v-set:not([hidden]){display:grid;grid-template-columns:190px minmax(0,1fr);gap:28px;align-items:start}
+  #setnav{flex-direction:column;position:sticky;top:68px;overflow:visible}
+  #setnav button{border-radius:10px;justify-content:flex-start}
+  #setbody{max-width:720px}
+}
+/*ARMCSS*/
 </style>
 </head>
 <body>
@@ -2888,46 +3270,81 @@ details{margin:14px 2px}summary{cursor:pointer;color:var(--dim);font-size:14px}
   <button id="unlock" class="wide" style="margin-top:12px;border-color:var(--go);color:var(--go);font-weight:650">Unlock</button>
 </main>
 
+<div id="app">
+<aside id="side">
 <main id="v-files">
   <button id="upnote" class="msg ok wide" style="justify-content:flex-start;text-align:left" hidden></button>
   <label class="btn wide"><input id="up" type="file" accept=".svg,image/svg+xml" hidden>Send a file from this device</label>
   <div id="libmsg" class="msg bad" hidden></div>
+  <input id="search" type="search" placeholder="Search files" aria-label="Search files" autocomplete="off">
+  <div id="recentbox" hidden><div class="lbl2">Recent</div><ul id="recent"></ul></div>
+  <div class="lbl2" id="listlbl">Files</div>
   <ul id="list"></ul>
   <p id="empty" class="note" hidden></p>
   <button id="refresh" class="small wide">Refresh list</button>
+  <div id="histbox" hidden><div class="lbl2">History</div><ul id="hist"></ul></div>
 </main>
+</aside>
+<section id="mainpane">
+<div id="v-none" class="note" hidden>Pick a file on the left, or drop an SVG anywhere on this page.</div>
 
 <main id="v-job" hidden>
-  <div id="fname"></div>
-  <div id="stage"></div>
-  <div id="dims"></div>
-  <div id="warns"></div>
-  <div class="row">
-    <button id="rot">Rotate</button>
-    <button id="mir" aria-pressed="false">Mirror</button>
+  <div id="jobview">
+    <div id="fname"></div>
+    <div id="stage"></div>
+    <div id="legend"><span><i style="background:var(--go)"></i>This job</span><span><i style="background:var(--dim);opacity:.4"></i>Already cut</span><span><i style="background:var(--go);border-radius:50%;width:10px"></i>Start point</span></div>
+    <div id="dims"></div>
+    <div id="warns"></div>
   </div>
-  <div class="step">
-    <button id="minus" aria-label="Fewer copies">&minus;</button>
-    <div><output id="cnt">1</output><small id="cntl">copy</small></div>
-    <button id="plus" aria-label="More copies">+</button>
+  <div id="jobctl">
+    <div class="row">
+      <button id="rot">Rotate</button>
+      <button id="mir" aria-pressed="false">Mirror</button>
+    </div>
+    <div class="step">
+      <button id="minus" aria-label="Fewer copies">&minus;</button>
+      <div><output id="cnt">1</output><small id="cntl">copy</small></div>
+      <button id="plus" aria-label="More copies">+</button>
+    </div>
+    <div id="layrow" hidden>
+      <div class="seglbl">Copies</div>
+      <div class="seg"><button id="lay-across" aria-pressed="true">Side by side</button><button id="lay-stacked" aria-pressed="false">Stacked</button></div>
+    </div>
+    <div id="plcrow" hidden>
+      <div class="seglbl">Where on the vinyl</div>
+      <div class="seg"><button id="plc-auto" aria-pressed="true">Next free spot</button><button id="plc-origin" aria-pressed="false">At the start point</button><button id="plc-knife" aria-pressed="false">At the knife</button></div>
+    </div>
+    <div class="seglbl">Start jobs from</div>
+    <div class="seg"><button id="crn-left" aria-pressed="true">Left edge</button><button id="crn-right" aria-pressed="false">Right edge</button></div>
+    <details id="knifecard" class="card" hidden>
+      <summary>Move knife</summary>
+      <p class="note" style="margin-top:6px">Knife up. Moves stay inside the cutting area.</p>
+      <div class="seg" id="kstep"><button data-i="0" aria-pressed="false">Fine</button><button data-i="1" aria-pressed="true">Medium</button><button data-i="2" aria-pressed="false">Coarse</button></div>
+      <div class="kgrid">
+        <span></span><button id="k-back" aria-label="Move the knife away from you">&uarr;</button><span></span>
+        <button id="k-left" aria-label="Move the knife left">&larr;</button><span></span><button id="k-right" aria-label="Move the knife right">&rarr;</button>
+        <span></span><button id="k-front" aria-label="Move the knife toward you">&darr;</button><span></span>
+      </div>
+      <div id="kpos"></div>
+      <div id="kmsg" class="note" hidden></div>
+      <button id="k-set" class="wide" style="border-color:var(--go);color:var(--go);font-weight:650">Set start point here</button>
+      <button id="k-clear" class="small wide" style="margin-top:8px" hidden>Use the plotter's own start point</button>
+    </details>
+    <div id="progcard" class="card" hidden>
+      <div class="pc-top"><span id="pc-pct">0%</span><span id="pc-eta"></span></div>
+      <div id="arm" class="arm"></div>
+      <div id="prog" hidden><div id="bar"></div></div>
+      <div class="pc-foot"><span id="pc-start"></span><span id="pc-what"></span></div>
+    </div>
+    <div id="jobmsg" class="note"></div>
+    <div class="cutrow">
+      <button id="cut">CUT</button>
+      <button id="stop">Stop</button>
+    </div>
+    <p id="keys" class="note">Keys: <span class="kbd">R</span> rotate <span class="kbd">M</span> mirror <span class="kbd">+</span> <span class="kbd">&minus;</span> copies <span class="kbd">Enter</span> twice to cut <span class="kbd">Esc</span> stop</p>
+    <div class="card"><div class="lbl2" style="margin-top:0">Plotter</div><div id="statpanel" class="stat"></div></div>
+    <button id="del" class="small wide" style="margin-top:14px;border-color:var(--bad);color:var(--bad)">Delete this file</button>
   </div>
-  <div id="layrow" hidden>
-    <div class="seglbl">Copies</div>
-    <div class="seg"><button id="lay-across" aria-pressed="true">Side by side</button><button id="lay-stacked" aria-pressed="false">Stacked</button></div>
-  </div>
-  <div id="plcrow" hidden>
-    <div class="seglbl">Where on the vinyl</div>
-    <div class="seg"><button id="plc-auto" aria-pressed="true">Next free spot</button><button id="plc-origin" aria-pressed="false">At the start point</button><button id="plc-knife" aria-pressed="false">At the knife</button></div>
-  </div>
-  <div class="seglbl">Start jobs from</div>
-  <div class="seg"><button id="crn-left" aria-pressed="true">Left edge</button><button id="crn-right" aria-pressed="false">Right edge</button></div>
-  <div id="prog" hidden><div id="bar"></div></div>
-  <div id="jobmsg" class="note"></div>
-  <div class="cutrow">
-    <button id="cut">CUT</button>
-    <button id="stop">Stop</button>
-  </div>
-  <button id="del" class="small wide" style="margin-top:22px;border-color:var(--bad);color:var(--bad)">Delete this file</button>
 </main>
 
 <main id="v-setup" hidden>
@@ -2961,6 +3378,45 @@ details{margin:14px 2px}summary{cursor:pointer;color:var(--dim);font-size:14px}
 </main>
 
 <main id="v-set" hidden>
+  <nav id="setnav" aria-label="Settings sections">
+    <button data-sec="vinyl">Vinyl</button><button data-sec="plotter">Plotter</button><button data-sec="thing">Car Thing</button>
+    <button data-sec="updates">Updates</button><button data-sec="access">Access</button><button data-sec="advanced">Advanced</button>
+  </nav>
+  <div id="setbody">
+  <div id="setmsg" class="msg bad" hidden></div>
+  <section class="sec" data-sec="vinyl">
+  <h2>Vinyl</h2>
+  <label class="f"><span id="l-vw">Usable vinyl width</span><input id="s-vw" inputmode="decimal"></label>
+  <label class="c"><input type="checkbox" id="s-autow">Take the width from the plotter</label>
+  <p class="note" id="vw-note">How far across the plotter can cut on the vinyl loaded now. Change it when you load a different width.</p>
+  <label class="f"><span id="l-gap">Gap between copies and jobs</span><input id="s-gap" inputmode="decimal"></label>
+  <label class="f">When the job ends<select id="s-end"><option value="origin">Return to the start point</option><option value="next">Move to the next free spot</option><option value="advance">Feed the vinyl past the job</option></select></label>
+  <label class="f">Show sizes in<select id="s-units"><option value="in">inches</option><option value="mm">millimetres</option></select></label>
+  </section>
+
+  <section class="sec" data-sec="plotter" hidden>
+  <h2>Plotter setup</h2>
+  <div class="setupsum"><div class="mini" id="su-now"></div><div><b id="su-nowtxt"></b><div class="note" style="margin:4px 0 0">Plotter setup makes cuts read normally where you stand. Run it once, and again if you change the plotter's own rotate or mirror settings.</div></div></div>
+  <button id="setup-open" class="wide" style="border-color:var(--go);color:var(--go);font-weight:650">Run plotter setup</button>
+  <button id="test" class="wide" style="margin-top:10px">Cut test logo</button>
+  <h2>Cutting</h2>
+  <label class="f"><span id="l-width">Widest the plotter can cut</span><input id="s-width" inputmode="decimal"></label>
+  <label class="f">Overcut on closed shapes (mm)<input id="s-over" inputmode="decimal"></label>
+  <h2>Progress and finish</h2>
+  <label class="c"><input type="checkbox" id="s-arm">Zombie arm progress bar (off: a plain bar)</label>
+  <label class="c"><input type="checkbox" id="s-chime">Chime when a cut finishes, on pages that are open</label>
+  <p class="note">Phones that can vibrate (Android) also vibrate. The Car Thing wakes and says Done.</p>
+  <h2>What the plotter reports</h2>
+  <div class="card"><div id="statpanel2" class="stat"></div></div>
+  </section>
+
+  <section class="sec" data-sec="thing" hidden>
+  <h2>Car Thing</h2>
+  <label class="f">Screen goes dark when idle for<select id="s-tsleep"><option value="0">Never</option><option value="1">1 minute</option><option value="2">2 minutes</option><option value="5">5 minutes</option><option value="10">10 minutes</option><option value="30">30 minutes</option></select></label>
+  <p class="note">Any dial turn or button press wakes it, and that first touch only wakes it. It also wakes when a cut starts or finishes.</p>
+  </section>
+
+  <section class="sec" data-sec="updates" hidden>
   <h2>Updates</h2>
   <p id="up-info" class="note">Checking the installed version.</p>
   <div id="up-msg" class="msg" hidden></div>
@@ -2970,7 +3426,9 @@ details{margin:14px 2px}summary{cursor:pointer;color:var(--dim);font-size:14px}
   </div>
   <label class="c"><input type="checkbox" id="s-auto">Install updates automatically (overnight, never during a cut)</label>
   <button id="up-back" class="small wide" hidden>Go back to the previous version</button>
+  </section>
 
+  <section class="sec" data-sec="access" hidden>
   <h2>Access</h2>
   <p id="pin-info" class="note"></p>
   <label class="f">New PIN (4 or more characters)<input id="s-pin" type="password" autocomplete="new-password"></label>
@@ -2978,36 +3436,17 @@ details{margin:14px 2px}summary{cursor:pointer;color:var(--dim);font-size:14px}
     <button id="pin-set">Set PIN</button>
     <button id="pin-clear">Remove PIN</button>
   </div>
+  </section>
 
-  <h2>Vinyl</h2>
-  <label class="f"><span id="l-vw">Usable vinyl width</span><input id="s-vw" inputmode="decimal"></label>
-  <label class="c"><input type="checkbox" id="s-autow">Take the width from the plotter</label>
-  <p class="note" id="vw-note">How far across the plotter can cut on the vinyl loaded now. Change it when you load a different width.</p>
-  <label class="f"><span id="l-gap">Gap between copies and jobs</span><input id="s-gap" inputmode="decimal"></label>
-  <label class="f">When the job ends<select id="s-end"><option value="origin">Return to the start point</option><option value="next">Move to the next free spot</option><option value="advance">Feed the vinyl past the job</option></select></label>
-  <label class="f">Overcut on closed shapes (mm)<input id="s-over" inputmode="decimal"></label>
-  <label class="f">Show sizes in<select id="s-units"><option value="in">inches</option><option value="mm">millimetres</option></select></label>
-
-  <h2>Plotter</h2>
-  <label class="f"><span id="l-width">Widest the plotter can cut</span><input id="s-width" inputmode="decimal"></label>
-  <div class="setupsum"><div class="mini" id="su-now"></div><div><b id="su-nowtxt"></b><div class="note" style="margin:4px 0 0">Plotter setup makes cuts read normally where you stand. Run it once, and again if you change the plotter's own rotate or mirror settings.</div></div></div>
-  <button id="setup-open" class="wide" style="border-color:var(--go);color:var(--go);font-weight:650">Run plotter setup</button>
-  <button id="test" class="wide" style="margin-top:10px">Cut test logo</button>
-
-  <h2>Car Thing</h2>
-  <label class="f">Screen goes dark when idle for<select id="s-tsleep"><option value="0">Never</option><option value="1">1 minute</option><option value="2">2 minutes</option><option value="5">5 minutes</option><option value="10">10 minutes</option><option value="30">30 minutes</option></select></label>
-  <p class="note">Any dial turn or button press wakes it, and that first touch only wakes it. It also wakes when a cut starts or finishes.</p>
-
+  <section class="sec" data-sec="advanced" hidden>
   <h2>Connection</h2>
-  <label class="f">Cable type<select id="s-link"><option value="auto">Find it automatically</option><option value="parallel">Parallel (USB-to-parallel cable)</option><option value="serial">Serial (USB-to-serial cable)</option></select></label>
+  <label class="f">Cable type<select id="s-link"><option value="auto">Find it automatically</option><option value="parallel">Parallel (USB-to-parallel cable)</option><option value="serial">Serial (USB-to-serial cable or the Pi's serial pins)</option></select></label>
   <label class="f">Flow control, serial only (plotter menu: H-WIRE = Hardware). Not used when the plotter answers zombiePlot: then zombiePlot paces the data itself.<select id="s-flow"><option value="hardware">Hardware</option><option value="xonxoff">XON/XOFF</option><option value="none">None</option></select></label>
   <label class="f">Baud rate, serial only<select id="s-baud"><option>2400</option><option>4800</option><option>9600</option><option>19200</option></select></label>
   <label class="f">Port ("auto" finds the cable)<input id="s-port" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
   <label class="f">Plotter units per mm (Roland CAMM-1 and HP-GL: 40)<input id="s-upm" inputmode="decimal"></label>
   <label class="f">Pixels per inch, for files with no real size<input id="s-ppi" inputmode="decimal"></label>
   <p id="info" class="note"></p>
-  <div id="setmsg" class="msg bad" hidden></div>
-  <button id="save" class="wide" style="margin-top:8px;border-color:var(--go);color:var(--go);font-weight:650">Save settings</button>
 
   <h2>Plotter tests</h2>
   <p class="note">These show what the plotter reports, for working out problems. They need a serial cable. Nothing is cut: the knife stays up.</p>
@@ -3018,7 +3457,12 @@ details{margin:14px 2px}summary{cursor:pointer;color:var(--dim);font-size:14px}
   <button id="dg-stop" class="small wide" style="margin-top:10px" hidden>Stop test</button>
   <div id="dg-msg" class="msg" hidden></div>
   <pre id="dg-log" hidden></pre>
+  </section>
+  </div>
 </main>
+</section>
+</div>
+<div id="drop" hidden>Drop an SVG to open it</div>
 
 <script>
 "use strict";
@@ -3041,7 +3485,7 @@ const post = (path, obj) => api(path, {method:"POST", headers:{"Content-Type":"a
 function showLogin(){
   if(S.view === "login") return;
   S.view = "login";
-  for(const v of ["files","job","set","setup"]) $("v-"+v).hidden = true;
+  for(const v of ["files","job","set","setup","none"]) $("v-"+v).hidden = true;
   $("v-login").hidden = false; $("vbar").hidden = true; $("back").hidden = true; $("gear").hidden = true; $("pill").hidden = true;
   $("brand").hidden = false; $("title").hidden = true;
   setTimeout(() => $("pin").focus(), 50);
@@ -3058,17 +3502,25 @@ const len = mm => S.units === "mm" ? mm.toFixed(1) + " mm" : (mm/25.4).toFixed(2
 const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const unit = () => S.units === "mm" ? 1 : 25.4;
 
+const WIDE = window.matchMedia("(min-width: 760px)");
+const wide = () => WIDE.matches;
 function show(view){
   S.view = view;
-  for(const v of ["files","job","set","setup"]) $("v-"+v).hidden = v !== view;
+  const w = wide();
+  for(const v of ["job","set","setup"]) $("v-"+v).hidden = v !== view;
+  $("v-files").hidden = !(w || view === "files");
+  $("v-none").hidden = !(w && view === "files");
   $("v-login").hidden = true; $("pill").hidden = false;
-  $("back").hidden = view === "files";
+  $("back").hidden = w ? !(view === "set" || view === "setup") : view === "files";
+  $("back").innerHTML = view === "setup" ? "&lsaquo; Settings" : w ? "&lsaquo; Done" : "&lsaquo; Files";
   $("gear").hidden = view === "set" || view === "setup";
   $("vbar").hidden = view === "set" || view === "setup";
-  $("brand").hidden = view !== "files"; $("title").hidden = view === "files";
+  $("brand").hidden = !w && view !== "files"; $("title").hidden = w || view === "files";
   $("title").textContent = view === "set" ? "Settings" : view === "setup" ? "Plotter setup" : "";
-  window.scrollTo(0,0);
+  if(!w) window.scrollTo(0,0);
+  markCurrent();
 }
+WIDE.addEventListener("change", () => { if(S.view && S.view !== "login") show(S.view); });
 
 function ago(t){
   const s = Date.now()/1000 - t;
@@ -3079,30 +3531,110 @@ function ago(t){
   return new Date(t*1000).toLocaleDateString();
 }
 
+const FOLD_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>';
+S.files = []; S.fold = {};
+try { S.fold = JSON.parse(localStorage.getItem("zp-fold") || "{}") || {}; } catch(e){ S.fold = {}; }
 async function loadFiles(){
   $("refresh").disabled = true;
   try{
     const r = await api("/api/files");
     $("libmsg").hidden = r.library_ok;
     $("libmsg").textContent = r.library_message + " Files sent from this device still work.";
-    const ul = $("list"); ul.textContent = "";
-    for(const f of r.files){
-      const li = document.createElement("li"), b = document.createElement("button");
-      b.innerHTML = '<span class="n">' + esc(f.name.replace(/\.svg$/i,"")) + (f.folder ? '<span class="f">' + esc(f.folder) + '</span>' : '') +
-        '</span><span class="s">' + ago(f.mtime) + '</span>';
-      b.onclick = () => openFile(f.id);
-      li.appendChild(b); ul.appendChild(li);
-    }
-    $("empty").hidden = r.files.length > 0;
-    $("empty").textContent = "No SVG files yet. Save one into " + r.library + " or send one from this device.";
+    S.files = r.files; S.library = r.library;
+    renderFiles();
   }catch(e){
     $("libmsg").hidden = false; $("libmsg").textContent = e.message;
   }
   $("refresh").disabled = false;
+  loadHistory();
+}
+function fileItem(f, inFolder){
+  const li = document.createElement("li"), b = document.createElement("button");
+  b.className = "file"; b.dataset.id = f.id;
+  b.innerHTML = '<span class="th" data-id="' + esc(f.id) + '"></span><span class="n">' + esc(f.name.replace(/\.svg$/i,"")) +
+    (f.folder ? '<span class="f">' + esc(f.folder) + '</span>' : '') + '</span><span class="s">' + ago(f.mtime) + '</span>';
+  b.onclick = () => openFile(f.id);
+  if(inFolder) li.className = "infold";
+  li.appendChild(b); return li;
+}
+function renderFiles(){
+  const q = $("search").value.trim().toLowerCase();
+  const list = $("list"), rec = $("recent"); list.textContent = ""; rec.textContent = "";
+  const files = S.files.filter(f => !q || (f.name + " " + (f.folder || "")).toLowerCase().includes(q));
+  const showRecent = !q && S.files.length > 6;
+  $("recentbox").hidden = !showRecent;
+  if(showRecent) for(const f of S.files.slice(0, 5)) rec.appendChild(fileItem(f, false));
+  const groups = new Map();
+  for(const f of files){ const k = f.folder || ""; if(!groups.has(k)) groups.set(k, []); groups.get(k).push(f); }
+  const keys = [...groups.keys()].sort((a, b) => a === "" ? -1 : b === "" ? 1 : a.localeCompare(b));
+  for(const k of keys){
+    if(k && !q){
+      const li = document.createElement("li"), b = document.createElement("button");
+      li.className = "fh"; b.setAttribute("aria-expanded", S.fold[k] ? "false" : "true");
+      b.innerHTML = FOLD_ICON + "<span>" + esc(k) + '</span><span class="c">' + groups.get(k).length + "</span>";
+      b.onclick = () => { S.fold[k] = !S.fold[k]; try { localStorage.setItem("zp-fold", JSON.stringify(S.fold)); } catch(e){} renderFiles(); };
+      li.appendChild(b); list.appendChild(li);
+      if(S.fold[k]) continue;
+    }
+    for(const f of groups.get(k)) list.appendChild(fileItem(f, !!k && !q));
+  }
+  $("listlbl").textContent = q ? "Matching files" : "Files";
+  $("empty").hidden = files.length > 0;
+  $("empty").textContent = q ? "No file names match." : "No SVG files yet. Save one into " + S.library + " or send one from this device.";
+  markCurrent(); loadThumbs();
+}
+function markCurrent(){
+  for(const b of document.querySelectorAll("button.file")) b.classList.toggle("cur", wide() && (S.view === "job") && b.dataset.id === S.id);
+}
+const thumbs = {};
+let thumbObs = null;
+function paintThumb(el, t){
+  if(!t || !t.d) return;
+  el.innerHTML = '<svg viewBox="0 0 ' + t.w + ' ' + t.h + '" preserveAspectRatio="xMidYMid meet" aria-hidden="true"><g transform="translate(0,' + t.h + ') scale(1,-1)"><path d="' + t.d + '" fill="none" stroke="currentColor" stroke-width="1.3" vector-effect="non-scaling-stroke"/></g></svg>';
+}
+async function fillThumb(el){
+  const id = el.dataset.id;
+  try {
+    if(!thumbs[id]) thumbs[id] = await api("/api/thumb?id=" + encodeURIComponent(id));
+    for(const e of document.querySelectorAll(".th[data-id]")) if(e.dataset.id === id) paintThumb(e, thumbs[id]);
+  } catch(e){}
+}
+function loadThumbs(){
+  if(!thumbObs && "IntersectionObserver" in window)
+    thumbObs = new IntersectionObserver(es => { for(const e of es) if(e.isIntersecting){ thumbObs.unobserve(e.target); fillThumb(e.target); } }, {rootMargin: "300px"});
+  for(const el of document.querySelectorAll(".th[data-id]")){
+    if(thumbs[el.dataset.id]) paintThumb(el, thumbs[el.dataset.id]);
+    else if(thumbObs) thumbObs.observe(el); else fillThumb(el);
+  }
+}
+async function loadHistory(){
+  try { S.hist = (await api("/api/history")).history; } catch(e){ return; }
+  const ul = $("hist"); ul.textContent = "";
+  const h = S.hist.slice(0, 8);
+  $("histbox").hidden = !h.length;
+  for(const e of h){
+    const li = document.createElement("li");
+    const when = new Date(e.t * 1000), today = new Date().toDateString() === when.toDateString();
+    const t = today ? when.toLocaleTimeString([], {hour: "numeric", minute: "2-digit"}) : when.toLocaleDateString();
+    const state = e.state === "sending" ? '<span class="now">Cutting now</span>' : e.state === "done" ? "Done"
+      : e.state === "stopped" ? '<span class="bad">Stopped at ' + e.pct + '%</span>' : '<span class="bad">Error at ' + e.pct + '%</span>';
+    li.innerHTML = '<div class="ht"><b>' + esc(String(e.name).replace(/\.svg$/i, "")) + '</b><span class="hs">' + esc(t) + '</span></div>' +
+      '<div class="hs">' + e.copies + (e.copies === 1 ? " copy" : " copies") + (e.layout === "stacked" && e.copies > 1 ? ", stacked" : "") +
+      " &middot; " + len(e.w) + " &times; " + len(e.h) + " &middot; " + state + "</div>";
+    if(e.state !== "sending" && e.id){
+      const b = document.createElement("button"); b.className = "small"; b.textContent = "Cut again";
+      b.onclick = () => openFile(e.id, {rot: e.rot, mirror: e.mirror, copies: e.copies, layout: e.layout});
+      li.appendChild(b);
+    }
+    ul.appendChild(li);
+  }
+  if(S.view === "job" || S.view === "set") paintStatPanels();
 }
 
-function openFile(id){
-  S.id = id; S.rot = "auto"; S.mirror = false; S.copies = 1; S.layout = "across"; S.place = "auto"; S.pv = null;
+function openFile(id, o){
+  o = o || {};
+  S.id = id; S.rot = o.rot !== undefined ? o.rot : "auto"; S.mirror = !!o.mirror; S.copies = o.copies || 1;
+  S.layout = o.layout || "across"; S.place = "auto"; S.pv = null;
   $("fname").textContent = ""; $("stage").textContent = ""; $("dims").textContent = "Loading"; $("warns").textContent = "";
   $("jobmsg").textContent = "";
   show("job"); refreshPreview();
@@ -3111,6 +3643,7 @@ function openFile(id){
 let pvSeq = 0;
 async function refreshPreview(){
   if(!S.id) return;
+  if(sending() && S.livePv){ draw(S.livePv); return; }
   const seq = ++pvSeq;
   disarm();
   $("mir").setAttribute("aria-pressed", S.mirror);
@@ -3178,14 +3711,36 @@ function draw(p){
   let uses = "";
   for(const q of p.rects) uses += '<use href="#one" x="' + sx(q[0], q[2]).toFixed(2) + '" y="' + sy(q[1], q[3]).toFixed(2) + '"/>';
   const r = Math.max(W, H) * 0.012;
-  $("stage").className = p.clash ? "clash" : "";
+  const live = S.live && p === S.livePv && sending() ? liveOverlay(p, sx, sy, r) : "";
+  $("stage").className = (p.clash && !live ? "clash" : "") + (live ? " cutting" : "");
   $("stage").innerHTML = '<svg viewBox="' + (minX - m) + " " + (-m) + " " + (W + 2*m) + " " + (top - bottom) + '" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Preview of the vinyl">' +
     '<g transform="translate(0,' + H + ') scale(1,-1)"><defs><path id="one" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" vector-effect="non-scaling-stroke" d="' + p.d + '"/></defs>' +
     (back ? '<path class="edge" d="M0 ' + (-m) + 'V' + H + 'H' + VW + 'V' + (-m) + '"/>' : '<path class="edge" d="M0 ' + top + 'V0H' + VW + 'V' + top + '"/>') + used +
-    '<rect class="jobbox" x="' + jx + '" y="' + sy(by, p.job_h) + '" width="' + p.job_w + '" height="' + p.job_h + '"/>' +
-    '<g>' + uses + '</g><circle class="org" cx="' + (right ? VW : 0) + '" cy="' + (back ? H : 0) + '" r="' + r + '"/></g>' +
+    (live ? "" : '<rect class="jobbox" x="' + jx + '" y="' + sy(by, p.job_h) + '" width="' + p.job_w + '" height="' + p.job_h + '"/>') +
+    '<g class="base">' + uses + '</g>' + live + '<circle class="org" cx="' + (right ? VW : 0) + '" cy="' + (back ? H : 0) + '" r="' + r + '"/></g>' +
     '<text class="lbl" x="0" y="' + (H + m + fs * 0.9) + '" font-size="' + fs + '">Left</text>' +
     '<text class="lbl" x="' + VW + '" y="' + (H + m + fs * 0.9) + '" font-size="' + fs + '" text-anchor="end">Right</text></svg>';
+}
+// What has been cut so far: finished copies in green, the copy being cut path by path, the knife.
+function liveOverlay(p, sx, sy, r){
+  const L = S.live, sent = S.status.job.sent, base0 = L.copy_starts[0], span0 = Math.max(1, L.copy_ends[0] - base0);
+  let out = '<g fill="none" stroke-linejoin="round" vector-effect="non-scaling-stroke">';
+  let knife = null;
+  for(let k = 0; k < L.rects.length; k++){
+    const q = L.rects[k], x = sx(q[0], q[2]), y = sy(q[1], q[3]);
+    const cs = L.copy_starts[k], ce = L.copy_ends[k];
+    if(sent >= ce){ out += '<use href="#one" class="cut-done" x="' + x.toFixed(2) + '" y="' + y.toFixed(2) + '"/>'; continue; }
+    if(sent <= cs){ if(!knife) knife = [x + L.starts[0][0], y + L.starts[0][1]]; continue; }
+    const f = (sent - cs) / Math.max(1, ce - cs);
+    for(let i = 0; i < L.paths.length; i++){
+      const end = (L.path_ends[i] - base0) / span0;
+      if(end <= f) out += '<path class="cut-done" vector-effect="non-scaling-stroke" transform="translate(' + x.toFixed(2) + ' ' + y.toFixed(2) + ')" d="' + L.paths[i] + '"/>';
+      else { if(!knife) knife = [x + L.starts[i][0], y + L.starts[i][1]]; }
+    }
+  }
+  if(knife) out += '<circle class="knife" cx="' + knife[0].toFixed(2) + '" cy="' + knife[1].toFixed(2) + '" r="' + (r * 1.1) + '"/>' +
+    '<path class="knife" d="M' + (knife[0] - r * 2) + ' ' + knife[1] + 'h' + (r * 4) + 'M' + knife[0] + ' ' + (knife[1] - r * 2) + 'v' + (r * 4) + '"/>';
+  return out + "</g>";
 }
 
 function disarm(){ S.armed = 0; }
@@ -3206,43 +3761,111 @@ function paintVinyl(){
   $("vundo").hidden = !v.jobs;
 }
 
+function sending(){ const j = S.status && S.status.job; return !!(j && (j.state === "sending" || j.state === "stopping")); }
 function paint(){
-  const st = S.status, job = st && st.job, sending = job && (job.state === "sending" || job.state === "stopping");
+  const st = S.status, job = st && st.job, busy = sending();
   const pill = $("pill"); let cls = "", txt = "Checking";
   if(!st){ cls = "bad"; txt = "Offline"; }
-  else if(sending){ cls = "ok"; txt = job.state === "stopping" ? "Stopping" : (job.tracked ? "Cutting " : "Sending ") + Math.floor(100 * job.sent / Math.max(1, job.total)) + "%"; }
+  else if(busy){ cls = "ok"; txt = job.state === "stopping" ? "Stopping" : (job.tracked ? "Cutting " : "Sending ") + Math.floor(100 * job.sent / Math.max(1, job.total)) + "%"; }
   else if(st.port.state === "missing"){ cls = "bad"; txt = "No cable"; }
   else if(st.port.state === "notready"){ cls = "warn"; txt = "Not ready"; }
   else { cls = "ok"; txt = "Ready"; }
-  if(st && !sending && st.port.link && st.port.state !== "missing") txt += " \u00b7 " + (st.port.link === "serial" ? "SER" : "PAR");
+  if(st && !busy && st.port.link && st.port.state !== "missing") txt += " · " + (st.port.link === "serial" ? "SER" : "PAR");
   pill.className = cls; pill.lastChild.textContent = txt;
-  if(job && S.lastJob && S.lastJob !== job.state && job.state === "done" && navigator.vibrate) navigator.vibrate([150, 80, 150]);
-  S.lastJob = job ? job.state : "";
+  if(job){
+    if(job.seq !== S.jobSeq){
+      const first = S.jobSeq === undefined; S.jobSeq = job.seq;
+      if(busy){ S.jobT0 = first && job.started ? Date.now() - Math.max(0, (Date.now() / 1000 - job.started)) * 1000 : Date.now(); loadLive(); }
+    }
+    if((S.lastJob === "sending" || S.lastJob === "stopping") && !busy){
+      S.finishedAt = Date.now();
+      if(job.state === "done"){ if(navigator.vibrate) navigator.vibrate([150, 80, 150]); if(st.chime) chime(); }
+      S.live = null; S.livePv = null; S.armKey = "";
+      loadHistory();
+      if(S.view === "job") refreshPreview();
+    }
+    S.lastJob = job.state;
+  }
   paintVinyl();
   paintUpNote();
   const cut = $("cut");
-  cut.disabled = !!sending || !S.pv || !S.pv.fits || !st;
+  cut.disabled = busy || !S.pv || !S.pv.fits || !st;
   const armed = S.armed && Date.now() < S.armed;
-  cut.textContent = sending ? (job.tracked ? "CUTTING" : "SENDING") : armed ? (S.pv && S.pv.clash ? "CUTS OVER USED VINYL - TAP AGAIN" : "TAP AGAIN TO CUT") : "CUT";
-  $("prog").hidden = !sending;
-  if(sending) $("bar").style.width = (100 * job.sent / Math.max(1, job.total)).toFixed(1) + "%";
+  cut.textContent = busy ? (job.tracked ? "CUTTING" : "SENDING") : armed ? (S.pv && S.pv.clash ? "CUTS OVER USED VINYL - TAP AGAIN" : "TAP AGAIN TO CUT") : "CUT";
+  const card = !!job && (busy || (S.finishedAt && Date.now() - S.finishedAt < 20000 && job.state !== "idle"));
+  $("progcard").hidden = !card;
+  if(card) paintProgress(job, busy);
   let m = "";
   if(job){
-    if(job.state === "sending" && job.tracked) m = job.waiting ? "The plotter has paused. Check its panel." : "Cutting " + job.name + ".";
-    else if(job.state === "sending") m = job.waiting ? "Waiting for the plotter to take more data." : "Sending " + job.name + " to the plotter.";
+    if(job.state === "sending" && job.tracked) m = job.waiting ? "The plotter has paused. Check its panel." : "Cutting " + job.name.replace(/\.svg$/i, "") + ".";
+    else if(job.state === "sending") m = job.waiting ? "Waiting for the plotter to take more data." : "Sending " + job.name.replace(/\.svg$/i, "") + " to the plotter.";
     else if(job.state === "stopping") m = "Stopping.";
     else if(job.state === "done") m = job.message || "Sent. The plotter keeps cutting until it finishes what it was sent.";
     else if(job.state === "stopped" || job.state === "error") m = job.message;
   }
   if(S.view === "job") $("jobmsg").textContent = m;
-  for(const id of ["rot","mir","minus","plus","test","save","vnew","vundo","vwidth","lay-across","lay-stacked","plc-auto","plc-origin","plc-knife","crn-left","crn-right","del"]) $(id).disabled = !!sending;
-  if(sending && S.view === "set"){ $("up-install").disabled = true; $("up-back").disabled = true; }
+  for(const id of ["rot","mir","minus","plus","test","vnew","vundo","vwidth","lay-across","lay-stacked","plc-auto","plc-origin","plc-knife","crn-left","crn-right","del","k-back","k-left","k-right","k-front","k-set","k-clear"]) $(id).disabled = busy;
+  if(busy && S.view === "set"){ $("up-install").disabled = true; $("up-back").disabled = true; }
+  const talks = !!(st && st.port && st.port.answers);
+  $("knifecard").hidden = !talks;
+  $("k-clear").hidden = !(st && st.vinyl && st.vinyl.offset && (st.vinyl.offset[0] || st.vinyl.offset[1]));
+  if(S.view === "job" || S.view === "set") paintStatPanels();
+  if(busy && S.live && S.livePv && S.view === "job" && job.sent !== S.liveSent){ S.liveSent = job.sent; draw(S.livePv); }
+}
+function paintProgress(job, busy){
+  const done = job.state === "done" && !busy;
+  const f = done ? 1 : Math.min(1, job.sent / Math.max(1, job.total)), pct = Math.floor(100 * f);
+  $("pc-pct").textContent = done ? "Done" : job.state === "stopped" ? "Stopped" : job.state === "error" ? "Error" : pct + "%";
+  let eta = "";
+  if(busy && S.jobT0 && f > 0.05 && f < 1){
+    const el = (Date.now() - S.jobT0) / 1000, left = el * (1 - f) / f;
+    eta = left < 60 ? "under a minute left" : "about " + Math.round(left / 60) + " min left";
+  }
+  $("pc-eta").textContent = eta;
+  const arm = !S.status || S.status.progress_style !== "classic";
+  $("arm").hidden = !arm; $("prog").hidden = arm;
+  if(arm){
+    const W = Math.max(40, Math.floor(($("arm").clientWidth || 320) / 4)), key = W + ":" + (done ? 100 : pct);
+    if(key !== S.armKey){ S.armKey = key; $("arm").innerHTML = zpArm(W, done ? 100 : pct); }
+  } else $("bar").style.width = (100 * f).toFixed(1) + "%";
+  $("pc-what").textContent = (job.name || "").replace(/\.svg$/i, "");
+  $("pc-start").textContent = S.jobT0 ? "started " + new Date(S.jobT0).toLocaleTimeString([], {hour: "numeric", minute: "2-digit"}) : "";
+}
+async function loadLive(){
+  try {
+    const r = await api("/api/job/live");
+    if(r.live && S.status && S.status.job && r.live.seq === S.status.job.seq){
+      S.live = r.live; S.liveSent = -1;
+      if(!S.livePv && S.cutPv) S.livePv = S.cutPv;
+    }
+  } catch(e){}
+}
+function statRows(){
+  const st = S.status;
+  if(!st) return [["zombiePlot box", "not reachable"]];
+  const p = st.port, rows = [];
+  rows.push(["Cable", p.state === "missing" ? "not found" : (p.link === "serial" ? "Serial" : "Parallel") + " · " + String(p.device || "").replace("/dev/", "")]);
+  if(p.model) rows.push(["Model", p.model]);
+  if(p.link === "serial") rows.push(["Answers zombiePlot", p.answers ? '<span class="yes">Yes, progress is live</span>' : p.answers === false ? "No" : "Checking"]);
+  if(p.width_mm) rows.push(["Cutting width", len(st.vinyl.width_mm) + " from the start point"]);
+  const o = st.vinyl && st.vinyl.offset;
+  rows.push(["Start point", o && (o[0] || o[1]) ? "set here, " + len(o[0]) + " across, " + len(o[1]) + " along" : "the plotter's own"]);
+  const h = S.hist && S.hist[0];
+  if(h) rows.push(["Last job", (h.state === "done" ? "Done" : h.state === "sending" ? "Cutting" : h.state === "stopped" ? "Stopped" : "Error") + " · " + esc(String(h.name).replace(/\.svg$/i, ""))]);
+  return rows;
+}
+function paintStatPanels(){
+  const html = statRows().map(r => "<span>" + r[0] + "</span><span>" + r[1] + "</span>").join("");
+  for(const id of ["statpanel", "statpanel2"]){ const el = $(id); if(el.innerHTML !== html) el.innerHTML = html; }
 }
 
 function movedText(mv){
+  const dropped = mv.dropped ? " " + mv.dropped + " earlier job" + (mv.dropped === 1 ? " is" : "s are") + " now outside the cutting area and no longer shown." : "";
+  if(mv.kind === "set") return "Start point set at the knife, " + len(mv.across) + " across and " + len(mv.along) + " along from the old one. zombiePlot moved its sheet memory to match, so earlier jobs are still marked where they are on the vinyl." + dropped;
+  if(mv.kind === "clear") return "Start point back at the plotter's own. zombiePlot moved its sheet memory to match.";
   return "The plotter's start point moved " + len(mv.across) + " across and " + len(mv.along) + " along (ORIGIN was pressed, or the plotter was switched off and on). " +
-         "zombiePlot moved its sheet memory to match, so earlier jobs are still marked where they are on the vinyl." +
-         (mv.dropped ? " " + mv.dropped + " earlier job" + (mv.dropped === 1 ? " is" : "s are") + " now outside the cutting area and no longer shown." : "");
+         "zombiePlot moved its sheet memory to match, so earlier jobs are still marked where they are on the vinyl." + dropped +
+         (mv.cleared ? " The start point set from the app was cleared." : "");
 }
 
 function plotterLine(p){
@@ -3278,27 +3901,28 @@ async function poll(){
     if(S.moveSeen !== undefined || mv.age < 120){
       const box = $("pillmsg"); box.textContent = movedText(mv); box.className = "msg ok"; box.hidden = false;
       clearTimeout(S.moveTimer); S.moveTimer = setTimeout(() => { box.hidden = true; }, 15000);
-      if(S.view === "job") refreshPreview();
+      if(S.view === "job" && !sending()) refreshPreview();
     }
     S.moveSeen = mv.id;
   }
   if(!mv && S.moveSeen === undefined) S.moveSeen = null;
   const jobs = S.status && S.status.vinyl ? S.status.vinyl.jobs : -1;
-  if(jobs !== S.vjobs){ const first = S.vjobs === -1; S.vjobs = jobs; if(!first && S.view === "job") refreshPreview(); }
+  if(jobs !== S.vjobs){ const first = S.vjobs === -1; S.vjobs = jobs; if(!first && S.view === "job" && !sending()) refreshPreview(); }
   paint();
 }
 
 async function doCut(){
-  if(!S.pv) return;
+  if(!S.pv || sending()) return;
   if(!(S.armed && Date.now() < S.armed)){ S.armed = Date.now() + 4000; paint(); setTimeout(paint, 4050); return; }
   disarm();
+  S.cutPv = S.pv;
   try{
     await post("/api/cut", {id:S.id, rot:S.rot, mirror:S.mirror, copies:S.copies, layout:S.layout, place:S.place});
     $("jobmsg").textContent = "";
-    S.place = "auto";
-  }catch(e){ $("warns").innerHTML = '<div class="msg bad">' + esc(e.message) + "</div>"; }
+    S.place = "auto"; S.livePv = S.cutPv; S.jobT0 = Date.now(); S.armKey = "";
+  }catch(e){ S.cutPv = null; $("warns").innerHTML = '<div class="msg bad">' + esc(e.message) + "</div>"; }
   await poll();
-  refreshPreview();
+  if(!sending()) refreshPreview();
 }
 
 async function loadSettings(){
@@ -3316,6 +3940,7 @@ async function loadSettings(){
     ? "The plotter reports " + len(pw) + " from its start point to the far edge. With the box ticked, zombiePlot uses that each time it changes (new vinyl, or ORIGIN pressed on the plotter). A width you type is kept until then."
     : "How far across the plotter can cut on the vinyl loaded now. Change it when you load a different width. A plotter on a two-way serial cable reports this itself.";
   $("s-tsleep").value = String(s.thing_sleep_min);
+  $("s-arm").checked = s.progress_style !== "classic"; $("s-chime").checked = !!s.chime;
   $("s-units").value = s.units; $("s-end").value = s.end_action; $("s-over").value = s.overcut_mm;
   $("s-swap").checked = s.swap_axes; $("s-mc").checked = s.mirror_carriage; $("s-mf").checked = s.mirror_feed;
   paintSetupSummary();
@@ -3365,7 +3990,8 @@ async function saveSettings(){
     units: $("s-units").value, end_action: $("s-end").value, overcut_mm: parseFloat($("s-over").value),
     link: $("s-link").value, flow: $("s-flow").value, baud: parseInt($("s-baud").value, 10),
     port: $("s-port").value.trim() || "auto", px_per_inch: parseFloat($("s-ppi").value),
-    steps_per_mm: parseFloat($("s-upm").value)
+    steps_per_mm: parseFloat($("s-upm").value),
+    progress_style: $("s-arm").checked ? "arm" : "classic", chime: $("s-chime").checked
   };
   for(const k in body) if(typeof body[k] === "number" && isNaN(body[k])) throw new Error("One of the number fields is empty or not a number.");
   await post("/api/settings", body);
@@ -3420,10 +4046,11 @@ function setMsg(text, ok){ const b = $("setmsg"); b.textContent = text; b.classN
 
 $("back").onclick = async () => {
   if(S.view === "setup"){ try { await loadSettings(); } catch(e){} show("set"); return; }
+  if(wide() && S.view === "set" && S.id){ show("job"); refreshPreview(); return; }
   show("files"); loadFiles();
 };
-$("gear").onclick = async () => { setMsg(""); try { await loadSettings(); show("set"); loadUpdates(); } catch(e){ alert(e.message); } };
-$("upnote").onclick = () => $("gear").onclick();
+$("gear").onclick = async () => { setMsg(""); try { await loadSettings(); show("set"); loadUpdates(); paintStatPanels(); } catch(e){ alert(e.message); } };
+$("upnote").onclick = async () => { await $("gear").onclick(); setSec("updates"); };
 $("unlock").onclick = unlock;
 $("pin").onkeydown = ev => { if(ev.key === "Enter") unlock(); };
 $("pin-set").onclick = async () => {
@@ -3560,7 +4187,19 @@ $("plc-origin").onclick = () => { S.place = "origin"; refreshPreview(); };
 $("plc-knife").onclick = () => { S.place = "knife"; S.reread = true; refreshPreview(); };
 $("cut").onclick = doCut;
 $("stop").onclick = async () => { disarm(); try { await post("/api/stop"); } catch(e){ $("jobmsg").textContent = e.message; } poll(); };
-$("save").onclick = async () => { try { await saveSettings(); setMsg("Saved.", true); } catch(e){ setMsg(e.message, false); } };
+// Settings save as they change.
+for(const id of ["s-vw","s-autow","s-gap","s-end","s-units","s-width","s-over","s-arm","s-chime","s-tsleep","s-link","s-flow","s-baud","s-port","s-upm","s-ppi"])
+  $(id).addEventListener("change", async () => {
+    try { await saveSettings(); setMsg("Saved.", true); clearTimeout(S.saveT); S.saveT = setTimeout(() => setMsg(""), 2500); poll(); }
+    catch(e){ setMsg(e.message, false); }
+  });
+function setSec(name){
+  S.sec = name;
+  for(const b of $("setnav").children) b.setAttribute("aria-current", b.dataset.sec === name ? "true" : "false");
+  for(const sec of document.querySelectorAll("#setbody .sec")) sec.hidden = sec.dataset.sec !== name;
+}
+for(const b of $("setnav").children) b.onclick = () => setSec(b.dataset.sec);
+setSec("vinyl");
 $("test").onclick = async () => {
   try { await saveSettings(); await post("/api/cut", {id:"test", rot:0, mirror:false, copies:1}); setMsg("Test square sent to the plotter.", true); }
   catch(e){ setMsg(e.message, false); }
@@ -3587,14 +4226,89 @@ $("vundo").onclick = async () => {
   if(!confirm("Forget the last job's area? Only do this if it did not actually cut.")) return;
   try { await post("/api/session/undo"); await poll(); if(S.view === "job") refreshPreview(); } catch(e){ alert(e.message); }
 };
-$("up").onchange = async ev => {
-  const f = ev.target.files[0]; ev.target.value = "";
-  if(!f) return;
+async function uploadFile(f){
   try{
     const r = await api("/api/upload?name=" + encodeURIComponent(f.name), {method:"POST", headers:{"X-ZombiePlot":"1"}, body:f});
-    openFile(r.id);
+    openFile(r.id); loadFiles();
   }catch(e){ $("libmsg").hidden = false; $("libmsg").textContent = e.message; }
+}
+$("up").onchange = ev => { const f = ev.target.files[0]; ev.target.value = ""; if(f) uploadFile(f); };
+$("search").addEventListener("input", renderFiles);
+let dragDepth = 0;
+const hasFiles = e => !!(e.dataTransfer && Array.from(e.dataTransfer.types || []).indexOf("Files") >= 0);
+window.addEventListener("dragenter", e => { if(hasFiles(e) && S.view !== "login"){ dragDepth++; $("drop").hidden = false; e.preventDefault(); } });
+window.addEventListener("dragover", e => { if(hasFiles(e)) e.preventDefault(); });
+window.addEventListener("dragleave", e => { if(hasFiles(e) && --dragDepth <= 0){ dragDepth = 0; $("drop").hidden = true; } });
+window.addEventListener("drop", e => {
+  if(!hasFiles(e)) return;
+  e.preventDefault(); dragDepth = 0; $("drop").hidden = true;
+  const f = e.dataTransfer.files[0];
+  if(f && S.view !== "login") uploadFile(f);
+});
+
+/* ---------- moving the knife ---------- */
+S.kstep = 1;
+const KSTEPS = {in: [0.254, 2.54, 25.4], mm: [0.25, 2.5, 25]};
+const KLABEL = {in: ["0.01 in", "0.1 in", "1 in"], mm: ["0.25 mm", "2.5 mm", "25 mm"]};
+function paintKstep(){
+  const u = S.units === "mm" ? "mm" : "in";
+  for(const b of $("kstep").children){ const i = +b.dataset.i; b.textContent = KLABEL[u][i]; b.setAttribute("aria-pressed", i === S.kstep); }
+}
+for(const b of $("kstep").children) b.onclick = () => { S.kstep = +b.dataset.i; paintKstep(); };
+function kmsg(t){ $("kmsg").textContent = t || ""; $("kmsg").hidden = !t; }
+function paintKpos(k){ $("kpos").textContent = k ? "Knife: " + len(k.across) + " across, " + len(k.along) + " along from the start point" : ""; }
+async function readKnife(){ try { paintKpos(await api("/api/knife")); kmsg(""); } catch(e){ kmsg(e.message); } }
+async function jog(dir){
+  if(sending()) return;
+  const v = S.status && S.status.vinyl, step = KSTEPS[S.units === "mm" ? "mm" : "in"][S.kstep];
+  const leftSign = v && v.origin_side === "right" ? 1 : -1, backSign = v && v.origin_row === "back" ? -1 : 1;
+  const d = {left: [leftSign * step, 0], right: [-leftSign * step, 0], back: [0, backSign * step], front: [0, -backSign * step]}[dir];
+  try { paintKpos(await post("/api/jog", {across: d[0], along: d[1]})); kmsg(""); } catch(e){ kmsg(e.message); }
+}
+for(const d of ["back", "left", "right", "front"]) $("k-" + d).onclick = () => jog(d);
+$("knifecard").addEventListener("toggle", () => { if($("knifecard").open){ paintKstep(); readKnife(); } });
+$("k-set").onclick = async () => {
+  try { await post("/api/start/set"); kmsg(""); await poll(); readKnife(); refreshPreview(); } catch(e){ kmsg(e.message); }
 };
+$("k-clear").onclick = async () => {
+  try { await post("/api/start/clear"); kmsg(""); await poll(); readKnife(); refreshPreview(); } catch(e){ kmsg(e.message); }
+};
+
+/* ---------- keys on a computer ---------- */
+document.addEventListener("keydown", e => {
+  if(!wide() || S.view !== "job" || e.metaKey || e.ctrlKey || e.altKey) return;
+  const t = e.target;
+  if(t && (t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA")) return;
+  const k = e.key;
+  if(k === "Escape"){ if(sending()) $("stop").click(); else disarm(), paint(); e.preventDefault(); return; }
+  if(sending()) return;
+  if(k === "r" || k === "R") $("rot").click();
+  else if(k === "m" || k === "M") $("mir").click();
+  else if(k === "+" || k === "=") $("plus").click();
+  else if(k === "-" || k === "_") $("minus").click();
+  else if(k === "Enter"){ if(t && t.tagName === "BUTTON" && t.id !== "cut") return; doCut(); }
+  else if($("knifecard").open && !$("knifecard").hidden && k.indexOf("Arrow") === 0) jog({ArrowLeft: "left", ArrowRight: "right", ArrowUp: "back", ArrowDown: "front"}[k]);
+  else return;
+  e.preventDefault();
+});
+
+/* ---------- the chime when a cut finishes ---------- */
+let actx = null;
+document.addEventListener("pointerdown", () => {
+  if(!actx){ try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch(e){} }
+  if(actx && actx.state === "suspended") actx.resume();
+}, {passive: true});
+function chime(){
+  if(!actx) return;
+  const t = actx.currentTime;
+  for(const [f, d] of [[660, 0], [880, 0.18]]){
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = "sine"; o.frequency.value = f;
+    g.gain.setValueAtTime(0.0001, t + d); g.gain.exponentialRampToValueAtTime(0.25, t + d + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t + d + 0.4);
+    o.connect(g); g.connect(actx.destination); o.start(t + d); o.stop(t + d + 0.45);
+  }
+}
+/*ARMJS*/
 
 (async function(){
   try { await loadSettings(); } catch(e){}
@@ -3870,6 +4584,12 @@ background:var(--panel);border:2px solid transparent}
 #cut{height:76px;font-size:26px;font-weight:750;letter-spacing:.04em;background:var(--go);color:var(--go-text);border:0}
 #cut.armed{background:var(--bad);color:#fff}
 #stop{height:76px;font-size:26px;font-weight:750;background:var(--bad);color:#fff;border:0}
+#armt{margin-top:8px}
+#v-knife{padding:18px 74px 0 22px}
+#kbig{font-size:30px;font-weight:700;margin-bottom:6px}
+#kposT{font-size:22px;margin:10px 0 14px}
+#kmsgT{color:var(--warn);font-size:18px;min-height:24px}
+/*ARMCSS*/
 #v-login{display:flex;align-items:center;justify-content:center;padding-right:64px}
 #v-login .l{width:300px;margin-right:40px}
 #dots{font-size:44px;letter-spacing:.2em;min-height:60px;margin-top:10px}
@@ -3905,12 +4625,20 @@ border-left:5px solid var(--bad);font-size:19px;box-shadow:0 6px 24px rgba(0,0,0
       <div id="warns"></div>
       <div class="hint" id="jobhint">Dial: copies &middot; Press dial: cut &middot; Back: files</div>
       <button id="cut" style="margin-top:6px">CUT</button>
+      <div id="armt" class="arm" hidden></div>
       <button id="stop" style="margin-top:6px" hidden>STOP</button>
     </div>
   </section>
   <section id="v-set" hidden>
     <ul id="slist"></ul>
     <div id="sethint">Dial: choose &middot; Press dial: change &middot; Back: done</div>
+  </section>
+  <section id="v-knife" hidden>
+    <div id="kbig">Move knife</div>
+    <div class="hint">Knife up. Moves stay inside the cutting area.</div>
+    <div id="kposT"></div>
+    <div id="kmsgT"></div>
+    <div class="hint">Dial: move &middot; Key 1: across or along &middot; Key 2: step size &middot; Back: done</div>
   </section>
   <section id="v-login" hidden>
     <div class="l"><div style="font-size:26px;font-weight:650">Enter the PIN</div>
@@ -3923,6 +4651,7 @@ border-left:5px solid var(--bad);font-size:19px;box-shadow:0 6px 24px rgba(0,0,0
 <script>
 "use strict";
 var $ = function(id){ return document.getElementById(id); };
+/*ARMJS*/
 var S = {view:"files", files:[], sel:0, id:null, rot:"auto", mirror:false, copies:1, layout:"across", place:"auto",
          units:"in", status:null, pv:null, arm:null, vjobs:-1, pin:""};
 
@@ -3959,7 +4688,7 @@ function twice(what, fn){
 
 function show(view){
   S.view = view;
-  var vs = ["files", "job", "set", "login"];
+  var vs = ["files", "job", "set", "knife", "login"];
   for(var i = 0; i < vs.length; i++) $("v-" + vs[i]).hidden = vs[i] !== view;
   paint();
 }
@@ -4117,6 +4846,17 @@ function keyMap(){
        S.place = order[(order.indexOf(S.place) + 1) % order.length];
        if(S.place === "knife") S.reread = true;
        refreshPreview(); }}];
+  if(S.view === "knife"){
+    var off = v && v.offset && (v.offset[0] || v.offset[1]);
+    return [
+      {label:S.kaxis === "across" ? "Across" : "Along", on:true,
+       run:function(){ S.kaxis = S.kaxis === "across" ? "along" : "across"; paint(); }},
+      {label:"Step " + kstepLabel(), run:function(){ S.kstepI = (S.kstepI + 1) % 3; paint(); }},
+      {label:armed("kset") ? "Press again" : "Set start here", armed:armed("kset"), off:busy,
+       run:function(){ twice("kset", async function(){ try { await post("/api/start/set"); toast("Start point set at the knife.", true); readKnifeT(); } catch(e){ toast(e.message); } poll(); }); }},
+      {label:"Plotter start", off:busy || !off,
+       run:async function(){ try { await post("/api/start/clear"); toast("Back to the plotter's own start point.", true); readKnifeT(); } catch(e){ toast(e.message); } poll(); }}];
+  }
   return [null, null, null, null];
 }
 function press(i){
@@ -4141,7 +4881,14 @@ function paint(){
     $("vtxt").innerHTML = "<b>" + len(v.width_mm) + "</b> vinyl" + (v.from_plotter ? " (from plotter)" : "") + " &middot; " +
       (v.jobs ? len(v.used_mm) + " used (" + v.jobs + " job" + (v.jobs === 1 ? "" : "s") + ")" : "nothing cut yet");
   } else $("vtxt").textContent = "";
-  $("bar2").style.width = busy ? (100 * job.sent / Math.max(1, job.total)).toFixed(1) + "%" : "0";
+  var frac = busy ? Math.min(1, job.sent / Math.max(1, job.total)) : 0, armOn = !st || st.progress_style !== "classic";
+  $("prog").style.visibility = armOn ? "hidden" : "visible";
+  $("bar2").style.width = (100 * frac).toFixed(1) + "%";
+  $("armt").hidden = !(busy && armOn && S.view === "job");
+  if(!$("armt").hidden){
+    var W = Math.max(40, Math.floor(($("armt").clientWidth || 300) / 4)), key = W + ":" + Math.floor(100 * frac);
+    if(key !== S.armKey){ S.armKey = key; $("armt").innerHTML = zpArm(W, Math.floor(100 * frac)); }
+  }
 
   var keys = keyMap();
   for(var i = 0; i < 4; i++){
@@ -4151,7 +4898,7 @@ function paint(){
     el.lastChild.textContent = k ? k.label : "";
   }
   $("km").className = "k m" + (busy ? "" : " cfg") + (!busy && S.view === "login" ? " empty" : "");
-  $("km").firstChild.textContent = busy ? "STOP" : (S.view === "set" ? "Done" : "Settings");
+  $("km").firstChild.textContent = busy ? "STOP" : (S.view === "set" || S.view === "knife" ? "Done" : "Settings");
   if(S.view === "set") paintSet();
 
   if(S.view === "job"){
@@ -4248,6 +4995,7 @@ S.ssel = 0; S.sedit = null; S.cfg = null;
 function mkey(){
   if(sending()){ stop(); return; }
   if(S.view === "login") return;
+  if(S.view === "knife"){ show("set"); loadSet(); return; }
   if(S.view === "set"){ show("files"); loadFiles(); return; }
   S.arm = null; S.ssel = 0; S.sedit = null; show("set"); loadSet();
 }
@@ -4270,6 +5018,9 @@ function setRows(){
     {label:"Vinyl width", value:len(Math.min(vw, c.cut_width_mm)) + (S.sedit === null && v && v.from_plotter ? ", from plotter" : ""), run:function(){
        if(S.sedit === null){ S.sedit = c.vinyl_width_mm; paintSet(); }
        else { var v = S.sedit; S.sedit = null; saveSet({vinyl_width_mm: v}, "Vinyl width saved."); } }},
+    {label:"Move knife", value:talks() ? "Dial moves it" : "needs serial", run:function(){
+       if(!talks()){ toast("Moving the knife needs the plotter on a serial cable, answering zombiePlot.", false); return; }
+       S.karm = null; show("knife"); readKnifeT(); }},
     {label:"Width from plotter", value:(c.auto_width ? "On" : "Off") + (pw ? " (reads " + len(pw) + ")" : ""), run:function(){
        saveSet({auto_width: !c.auto_width}, c.auto_width ? "Width from plotter off: the width you set is kept." : "Width from plotter on."); }},
     {label:"Screen sleep", value:c.thing_sleep_min ? c.thing_sleep_min + " min" : "Never", run:function(){
@@ -4303,8 +5054,23 @@ function setTurn(d){
 function setEnter(){ var r = setRows()[S.ssel]; if(r) r.run(); }
 
 /* ---------- Car Thing controls (and a keyboard, for trying it on a computer) ---------- */
+/* ---------- move knife ---------- */
+S.kaxis = "across"; S.kstepI = 1;
+var KST = {in: [0.254, 2.54, 25.4], mm: [0.25, 2.5, 25]}, KSL = {in: ["0.01 in", "0.1 in", "1 in"], mm: ["0.25 mm", "2.5 mm", "25 mm"]};
+function kstep(){ return KST[S.units === "mm" ? "mm" : "in"][S.kstepI]; }
+function kstepLabel(){ return KSL[S.units === "mm" ? "mm" : "in"][S.kstepI]; }
+function showKnife(k){ $("kposT").textContent = k ? len(k.across) + " across, " + len(k.along) + " along from the start point" : ""; }
+async function readKnifeT(){ try { showKnife(await api("/api/knife")); $("kmsgT").textContent = ""; } catch(e){ $("kmsgT").textContent = e.message; } }
+async function jogT(d){
+  if(sending()) return;
+  var v = S.status && S.status.vinyl, a = 0, b = 0;
+  if(S.kaxis === "across") a = d * kstep() * (v && v.origin_side === "right" ? -1 : 1);   /* dial clockwise moves right */
+  else b = d * kstep() * (v && v.origin_row === "back" ? -1 : 1);                          /* dial clockwise moves away from you */
+  try { showKnife(await post("/api/jog", {across: a, along: b})); $("kmsgT").textContent = ""; } catch(e){ $("kmsgT").textContent = e.message; }
+}
 function turn(d){
   if(S.view === "set"){ setTurn(d); return; }
+  if(S.view === "knife"){ jogT(d); return; }
   if(S.view === "files" && S.files.length){ S.sel = Math.max(0, Math.min(S.files.length - 1, S.sel + d)); paintSel(); }
   else if(S.view === "job") setCopies(S.copies + d);
 }
@@ -4315,6 +5081,7 @@ function enter(){
   else if(S.view === "login") unlock();
 }
 function back(){
+  if(S.view === "knife"){ show("set"); loadSet(); return; }
   if(S.view === "set"){ if(S.sedit !== null){ S.sedit = null; paintSet(); } else { show("files"); loadFiles(); } return; }
   if(S.view === "job"){ S.arm = null; S.id = null; S.pv = null; show("files"); loadFiles(); }
   else if(S.view === "login") pinKey("del");
@@ -4358,6 +5125,7 @@ setInterval(function(){ if(S.view === "files") loadFiles(); }, 30000);
 
 
 PAGE = PAGE.replace("/*LAYOUTS*/", json.dumps(setup_layouts()))
+PAGE, THING = [x.replace("/*ARMCSS*/", ARM_CSS).replace("/*ARMJS*/", ARM_JS) for x in (PAGE, THING)]
 PAGE, THING = [x.replace("/*MASCOT*/", MASCOT_CSS).replace("<!--LOGO-->", LOGO_SVG).replace("<!--ZOMBIE-->", ZOMBIE_SVG)
                 for x in (PAGE, THING)]
 

@@ -40,6 +40,20 @@ A small Raspberry Pi sits next to the cutter and stays switched on. You open a w
 
 The cable has to appear on the Pi as a printer port (`/dev/usb/lp0`) or a serial port (`/dev/ttyUSB0`). Both kinds of cable described above do.
 
+### New in 3.0
+
+- **Phone, tablet and desktop layouts.** On a tablet or computer the files stay on the left. On a wide screen the job controls sit in the middle and the preview on the right.
+- **Live cut view.** While cutting, the finished part of the design turns green on the preview and a crosshair shows where the knife is (serial cable).
+- **Zombie arm progress bar.** The arm reaches for the brain as the cut goes, and grabs it when the cut is done. Settings → Plotter → "Zombie arm progress bar" switches to a plain bar.
+- **Chime when a cut finishes**, on any phone, tablet or computer with the page open. Android phones also vibrate.
+- **History.** The last jobs, how each ended, and **Cut again**, which opens the job with the same copies, rotation and mirror.
+- **File list** with small pictures, a search box, recent files first, and folders you can fold away.
+- **Drag and drop** an SVG anywhere on the page to open it (computer).
+- **Keys on a computer:** R rotate, M mirror, + and − copies, Enter twice to cut, Esc to stop, arrow keys to move the knife when Move knife is open.
+- **Move knife** (serial cable): move the knife from the app in fine, medium or coarse steps, then **Set start point here**. Jobs, sheet memory and the vinyl width all follow it. **Use the plotter's own start point** undoes it. Pressing ORIGIN on the plotter also clears it. On the Car Thing it's in Settings → Move knife: the dial moves the knife, key 1 switches across and along, key 2 the step size, key 3 sets the start point (press twice) and key 4 goes back to the plotter's own.
+- **Settings in sections:** Vinyl, Plotter, Car Thing, Updates, Access, Advanced. Changes save as you make them.
+- **The Pi's own serial pins** (`/dev/serial0`) are found automatically once the serial console is turned off (see the Option B plan).
+
 ### Serial gives you more
 
 Over a two-way serial cable the plotter answers zombiePlot, which gives you:

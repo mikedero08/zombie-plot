@@ -138,6 +138,8 @@ try:
             check("settings: values loaded", pg.input_value("#s-width") == "22.992" and pg.input_value("#s-flow") == "none" and pg.input_value("#s-baud") == "9600", pg.input_value("#s-width"))
             check("settings: summary shows the start point", "front left" in pg.inner_text("#su-nowtxt"), pg.inner_text("#su-nowtxt"))
             # Plotter setup: cut the setup test, pick the picture that matches, check
+            check("settings: sections, Vinyl first", pg.is_visible("#s-vw") and pg.is_hidden("#setup-open"))
+            pg.click("#setnav button[data-sec=plotter]")
             pg.click("#setup-open"); pg.wait_for_selector("#v-setup:not([hidden])")
             pg.wait_for_function("document.querySelectorAll('#su-grid .tile').length === 8")
             check("setup: 8 pictures", True)
@@ -160,16 +162,18 @@ try:
             check("settings: summary now front right", "front right" in pg.inner_text("#su-nowtxt"), pg.inner_text("#su-nowtxt"))
             # back to all-off through the manual switches, then swap only for the rest of this test
             pg.click("#setup-open"); pg.wait_for_selector("#v-setup:not([hidden])")
-            pg.click("summary")
+            pg.click("#v-setup summary")
             pg.uncheck("#s-mc"); pg.check("#s-swap"); pg.uncheck("#s-mf")
             pg.click("#su-manual"); pg.wait_for_timeout(600)
             pg.click("#back"); pg.wait_for_selector("#v-set:not([hidden])")
-            pg.fill("#s-width", "15"); pg.click("#save")
+            pg.fill("#s-width", "15"); pg.press("#s-width", "Tab")
             pg.wait_for_function("document.querySelector('#setmsg').textContent === 'Saved.'")
             saved = json.load(open(os.path.join(data_dir, "config.json")))
             check("settings: saved in mm", abs(saved["cut_width_mm"] - 381.0) < 1e-6 and saved["swap_axes"] is True and saved["mirror_carriage"] is False, saved)
-            pg.select_option("#s-units", "mm"); pg.click("#save")
+            pg.click("#setnav button[data-sec=vinyl]")
+            pg.select_option("#s-units", "mm")
             pg.wait_for_function("document.querySelector('#s-width').value === '381'")
+            pg.click("#setnav button[data-sec=plotter]")
             check("settings: unit switch keeps the real width", abs(json.load(open(os.path.join(data_dir, "config.json")))["cut_width_mm"] - 381.0) < 1e-6)
             pg.click("#test")
             got = drain()
@@ -177,8 +181,10 @@ try:
             expect_tp = P.build_hpgl(tp, [(0.0, 0.0)], tw, th, dict(P.DEFAULTS, swap_axes=True))
             check("settings: test logo sent (swapped axes)", got == expect_tp, got[:60])
             pg.screenshot(path=os.path.join(OUT, "ui_settings.png"), full_page=True)
-            pg.fill("#s-width", ""); pg.click("#save")
+            pg.fill("#s-width", ""); pg.press("#s-width", "Tab")
             pg.wait_for_function("document.querySelector('#setmsg').textContent.includes('not a number')")
+            pg.click("#setnav button[data-sec=advanced]")
+            check("settings: arm progress bar on by default", pg.evaluate("S.status.progress_style") == "arm")
             check("settings: empty number caught", True)
 
             pg.click("#back"); pg.wait_for_selector("#list li")
@@ -193,6 +199,7 @@ try:
             pg.click("#pill"); check("status detail", "connected on" in pg.inner_text("#pillmsg"), pg.inner_text("#pillmsg"))
             # access PIN
             pg.click("#gear"); pg.wait_for_selector("#v-set:not([hidden])")
+            pg.click("#setnav button[data-sec=access]")
             check("no PIN by default, page says so", "No PIN" in pg.inner_text("#pin-info"))
             pg.fill("#s-pin", "2580"); pg.click("#pin-set")
             pg.wait_for_function("document.querySelector('#setmsg').textContent.startsWith('PIN set')")
@@ -309,7 +316,7 @@ try:
         check("thing: top-right button says Settings when idle", pc.inner_text("#km b") == "Settings")
         pc.keyboard.press("m")
         pc.wait_for_selector("#v-set:not([hidden])")
-        pc.wait_for_function("document.querySelectorAll('#slist li').length === 6")
+        pc.wait_for_function("document.querySelectorAll('#slist li').length === 7")
         pc.screenshot(path=os.path.join(OUT, "thing_settings.png"))
         w0 = json.load(open(cfgp))["vinyl_width_mm"]
         pc.keyboard.press("Enter")                       # edit vinyl width
@@ -320,6 +327,7 @@ try:
         pc.wait_for_timeout(400)
         w1 = json.load(open(cfgp))["vinyl_width_mm"]
         check("thing settings: dial changes the vinyl width by one step", 4.9 < w1 - w0 < 6.4, (w0, w1))
+        pc.mouse.wheel(30, 0); pc.wait_for_timeout(150)  # to Move knife
         pc.mouse.wheel(30, 0); pc.wait_for_timeout(150)  # to Width from plotter
         a0 = json.load(open(cfgp))["auto_width"]
         pc.keyboard.press("Enter"); pc.wait_for_timeout(500)

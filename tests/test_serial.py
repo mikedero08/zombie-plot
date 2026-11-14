@@ -105,6 +105,9 @@ class FakeRoland(threading.Thread):
                 self.reply("%d,%d,0" % self.pos)
             else:
                 self.cut += cmd
+                m = re.match(rb"P[UD](-?\d+),(-?\d+);", cmd)
+                if m:
+                    self.pos = (int(m.group(1)), int(m.group(2)))
 
     def run(self):
         import select
@@ -373,6 +376,78 @@ try:
     c, d = api("/api/diag/run", {"test": "motion"})
     check("motion test refused without room", c == 400 and "reports only" in d["error"], d)
     plotter.clip = "-6600,0,993320,11568"
+
+
+    # --- 3.0: history, thumbnails, live cut data ---
+    c, h = api("/api/history")
+    check("history recorded with results", c == 200 and len(h["history"]) >= 3 and h["history"][0]["state"] in ("done", "stopped")
+          and any(e["state"] == "stopped" and 0 <= e["pct"] < 100 for e in h["history"]) and any(e["state"] == "done" and e["pct"] == 100 for e in h["history"]), h["history"][:3])
+    c, t = api("/api/thumb?id=" + urllib.request.quote(ids["decal.svg"]))
+    check("thumbnail for the file list", c == 200 and t["d"].startswith("M") and t["w"] > 0, t)
+    c, t = api("/api/thumb?id=lib:../../etc/passwd")
+    check("thumbnail of a bad id gives nothing", c == 200 and t["d"] == "", t)
+    wait(lambda s: abs(s["vinyl"]["width_mm"] - 289.2) < 0.05)
+    plotter.paused = True
+    c, j = api("/api/cut", {"id": ids["decal.svg"], "rot": 0, "mirror": False, "copies": 2, "place": "origin"})
+    check("two-copy cut accepted", c == 200, j)
+    time.sleep(1.0)
+    c, lv = api("/api/job/live")
+    L = lv["live"]
+    check("live cut data for the running job", L and L["seq"] == status()["job"]["seq"] and len(L["copy_ends"]) == 2 and len(L["paths"]) >= 2
+          and len(L["path_ends"]) == len(L["paths"]) and L["copy_ends"][-1] <= L["total"] and L["copy_starts"][0] < L["copy_ends"][0], L and {k: L[k] for k in ("seq", "copy_ends", "total")})
+    api("/api/stop", {})
+    wait(lambda s: s["job"]["state"] != "sending")
+    plotter.paused = False
+    with plotter.lock:
+        plotter.buf.clear()
+    time.sleep(1.5)
+
+    # --- 3.0: moving the knife and setting the start point ---
+    api("/api/session/new", {})
+    plotter.pos = (0, 0)
+    c, k = api("/api/knife")
+    check("knife read at the plotter's start point", c == 200 and abs(k["across"]) < 0.01 and abs(k["along"]) < 0.01, k)
+    c, k = api("/api/jog", {"across": 50, "along": 25})
+    check("jog moves the knife", c == 200 and abs(k["across"] - 50) < 0.05 and abs(k["along"] - 25) < 0.05, k)
+    time.sleep(0.5)
+    check("jog is knife up, swapped axes respected", plotter.pos == (1000, 2000), plotter.pos)
+    c, k = api("/api/jog", {"across": 400, "along": 0})
+    check("jog stops at the edge of the cutting area", c == 200 and abs(k["across"] - 289.2) < 0.05, k)
+    c, k = api("/api/jog", {"across": 9999, "along": 0})
+    check("absurd jog refused", c == 400, k)
+    api("/api/jog", {"across": -239.2, "along": 0})
+    c, k = api("/api/knife")
+    check("knife back at 50, 25", abs(k["across"] - 50) < 0.05 and abs(k["along"] - 25) < 0.05, k)
+    c, r = api("/api/start/set", {})
+    st = status()
+    check("start point set at the knife", c == 200 and abs(st["vinyl"]["offset"][0] - 50) < 0.05 and abs(st["vinyl"]["offset"][1] - 25) < 0.05, st["vinyl"])
+    check("width now from the new start point", abs(st["vinyl"]["width_mm"] - 239.2) < 0.05, st["vinyl"]["width_mm"])
+    c, k = api("/api/knife")
+    check("knife reads 0,0 at the new start point", abs(k["across"]) < 0.05 and abs(k["along"]) < 0.05, k)
+    with plotter.lock:
+        plotter.cut.clear()
+    c, j = api("/api/cut", {"id": ids["decal.svg"], "rot": 0, "mirror": False, "copies": 1, "place": "origin"})
+    wait(lambda s: s["job"]["state"] != "sending")
+    pts = [tuple(map(int, m)) for m in re.findall(rb"P[UD](-?\d+),(-?\d+)", bytes(plotter.cut))]
+    check("cut lands at the new start point", min(p[0] for p in pts[:-1]) == 1000 and min(p[1] for p in pts[:-1]) == 2000, pts[:3])
+    check("and parks at the new start point", pts[-1] == (1000, 2000), pts[-1])
+    c, r = api("/api/start/clear", {})
+    st = status()
+    check("start point back to the plotter's own", st["vinyl"]["offset"] == [0.0, 0.0] and abs(st["vinyl"]["width_mm"] - 289.2) < 0.05, st["vinyl"])
+    sess = app.session.snapshot()["items"]
+    check("sheet memory moved back with it", len(sess) == 1 and abs(sess[0]["x"] - 50) < 0.05 and abs(sess[0]["y"] - 25) < 0.05, sess)
+    plotter.pos = (2000, 1000)
+    api("/api/start/set", {})
+    plotter.pos = (2000, 1000)
+    plotter.origin_here()
+    st = wait(lambda s: s["vinyl"]["offset"] == [0.0, 0.0])
+    mv = st["vinyl"]["moved"]
+    check("pressing ORIGIN clears the app's start point", st["vinyl"]["offset"] == [0.0, 0.0] and mv["kind"] == "origin" and mv["cleared"] is True, st["vinyl"])
+    c, r = api("/api/settings", {"progress_style": "classic", "chime": False})
+    check("progress style and chime settings", c == 200 and r["settings"]["progress_style"] == "classic" and r["settings"]["chime"] is False, r)
+    check("status carries them", status()["progress_style"] == "classic" and status()["chime"] is False)
+    c, r = api("/api/settings", {"progress_style": "zombie"})
+    check("bad progress style refused", c == 400, r)
 
     check("still never an overlap", plotter.overlap == 0, plotter.overlap)
     check("never overflowed", plotter.overflow == 0, plotter.overflow)
